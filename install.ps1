@@ -49,6 +49,9 @@ function Save-Url([string]$Url, [string]$OutFile) {
 
 Say 'Копирую скрипты и TrafikRuler...'
 New-Item -ItemType Directory -Force -Path $Dest | Out-Null
+# При повторной установке TrafikRuler уже запущен из $Dest и держит exe открытым.
+& taskkill.exe /IM TrafikRuler.exe /F 2>&1 | Out-Null
+Start-Sleep -Milliseconds 600
 Copy-Item -Path (Join-Path $Payload '*') -Destination $Dest -Recurse -Force
 
 $vpncmd = Find-VpnCmd
