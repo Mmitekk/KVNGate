@@ -108,6 +108,8 @@ $CacheDir    = Join-Path $env:LOCALAPPDATA 'VPNGateAuto'
 $CacheFile   = Join-Path $CacheDir 'last-list.csv'
 $KnownFile   = Join-Path $CacheDir 'known-good.txt'
 $BadFile     = Join-Path $CacheDir 'known-bad.txt'
+$GoogleGoodFile = Join-Path $CacheDir 'google-good.txt'
+$GoogleBadFile  = Join-Path $CacheDir 'google-bad.txt'
 $RotationFile = Join-Path $CacheDir 'rotation.txt'
 $LogFile     = Join-Path $CacheDir 'last-run.log'
 $Utf8NoBom   = New-Object System.Text.UTF8Encoding($false)
@@ -380,6 +382,32 @@ function Add-KnownBad([string]$Ep) {
     $list = @($Ep) + $list
     if ($list.Count -gt 200) { $list = $list[0..199] }
     Write-Endpoints $BadFile $list
+}
+
+# Google блокирует часть exit-IP VPN Gate (Antigravity/Gemini получают 403),
+# хотя сам туннель работает. Запоминаем такие адреса отдельно от known-bad,
+# чтобы не портить список рабочих туннелей, и предпочитаем проверенные.
+function Add-GoogleGood([string]$Ep) {
+    $list = @(Read-Endpoints $GoogleGoodFile | Where-Object { $_ -ne $Ep })
+    $list = @($Ep) + $list
+    if ($list.Count -gt 50) { $list = $list[0..49] }
+    Write-Endpoints $GoogleGoodFile $list
+    $bad = @(Read-Endpoints $GoogleBadFile | Where-Object { $_ -ne $Ep })
+    Write-Endpoints $GoogleBadFile $bad
+}
+function Add-GoogleBad([string]$Ep) {
+    $list = @(Read-Endpoints $GoogleBadFile | Where-Object { $_ -ne $Ep })
+    $list = @($Ep) + $list
+    if ($list.Count -gt 200) { $list = $list[0..199] }
+    Write-Endpoints $GoogleBadFile $list
+}
+function Test-GoogleOk {
+    # 403 на API-хосте Antigravity = Google блокирует exit-IP.
+    # 404/200/302 = хост доступен (404 — нормальный ответ API на «/»).
+    try {
+        $code = (& curl.exe -s -o NUL -w '%{http_code}' --max-time 12 'https://cloudcode-pa.googleapis.com/')
+        return ($code -ne '403')
+    } catch { return $true }
 }
 
 # ---------- круг шлюзов ----------
@@ -1030,6 +1058,12 @@ foreach ($b in $badList) { $badSet[$b] = $true }
 $goodSet  = @{}
 foreach ($g in $goodList) { $goodSet[$g] = $true }
 
+# Google-проверенные — в самый перёд; Google-заблокированные пропускаем.
+$googleGoodList = @(Read-Endpoints $GoogleGoodFile)
+$googleBadSet   = @{}
+foreach ($b in @(Read-Endpoints $GoogleBadFile)) { $googleBadSet[$b] = $true }
+$goodList = @($googleGoodList + $goodList | Select-Object -Unique)
+
 $byIp = @{}
 foreach ($r in $rows) { $byIp[$r.Ip] = $r }
 
@@ -1401,6 +1435,7 @@ if ($script:ReuseExisting) {
     }
 }
 
+$googleRejects = 0
 foreach ($ep in $candidates) {
     if ($ok) { break }
     if ($script:SkipEndpoints.ContainsKey("$($ep.Ip):$($ep.Port)")) { continue }
@@ -1491,6 +1526,22 @@ foreach ($ep in $candidates) {
         Add-KnownBad "$($ep.Ip):$($ep.Port)"
         Msg '  ✖ интернет не идёт через VPN — следующий'
         continue
+    }
+
+    # Туннель работает, но Google может блокировать exit-IP (Antigravity/Gemini
+    # получают 403). Отсеиваем такие шлюзы, чтобы агент не падал. Если подряд
+    # слишком много блокировок — всё же оставляем туннель, иначе VPN не поднять.
+    if (-not (Test-GoogleOk)) {
+        $googleRejects++
+        if ($googleRejects -le 6) {
+            Invoke-VpnCmd "AccountDisconnect $acct" | Out-Null
+            Add-GoogleBad "$($ep.Ip):$($ep.Port)"
+            Msg '  ✖ Google блокирует адрес (Antigravity/Gemini) — следующий'
+            continue
+        }
+        Msg '  ! Google блокирует многие адреса — оставляю этот туннель'
+    } else {
+        Add-GoogleGood "$($ep.Ip):$($ep.Port)"
     }
 
     # после подключения маршруты надо починить: VPN только что перехватил
