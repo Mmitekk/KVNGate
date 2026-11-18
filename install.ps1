@@ -30,7 +30,10 @@ function Find-VpnCmd {
         "$env:ProgramFiles\SoftEther VPN Client\vpncmd_x64.exe",
         "${env:ProgramFiles(x86)}\SoftEther VPN Client\vpncmd_x64.exe",
         'C:\Program Files\SoftEther VPN Client\vpncmd_x64.exe',
-        'C:\Program Files (x86)\SoftEther VPN Client\vpncmd_x64.exe'
+        'C:\Program Files (x86)\SoftEther VPN Client\vpncmd_x64.exe',
+        'I:\Program Files (x86)\SoftEther VPN Client\vpncmd_x64.exe',
+        'I:\Program Files (x86)\SoftEther VPN Client\vpncmd.exe',
+        'I:\Program Files\SoftEther VPN Client\vpncmd_x64.exe'
     )
     foreach ($c in $candidates) { if (Test-Path $c) { return $c } }
     return $null
@@ -94,20 +97,29 @@ function New-Link([string]$Name, [string]$Target, [string]$Args) {
 New-Link 'VPN Gate — Включить.lnk' (Join-Path $Dest 'VPNGateAuto.bat') $null
 New-Link 'VPN Gate — Выключить.lnk' (Join-Path $Dest 'VPNGateOff.bat') $null
 New-Link 'VPN Gate — Статус.lnk' (Join-Path $Dest 'VPNGateStatus.bat') $null
+New-Link 'VPN Gate — Окно.lnk' (Join-Path $Dest 'VPNGateUI.bat') $null
 New-Link 'TrafikRuler.lnk' (Join-Path $Dest 'TrafikRuler\TrafikRuler.exe') $null
 
-$task = 'VPNGateKeepGateways'
-$tr = "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$Dest\keep-gateways.ps1`""
-& schtasks.exe /Create /TN $task /SC ONLOGON /RL HIGHEST /F /TR $tr | Out-Null
-$running = @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" |
-    Where-Object { $_.CommandLine -like '*keep-gateways.ps1*' })
-if (-not $running) {
-    Start-Process powershell.exe -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-WindowStyle','Hidden','-File',"`"$Dest\keep-gateways.ps1`"")
+$split = Join-Path $Dest 'split-tunnel.ps1'
+if (Test-Path $split) {
+    Say 'Настраиваю задачи, перехват TrafikRuler и шлюзы...'
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $split -Bootstrap -NoElevate
+    if ($LASTEXITCODE -ne 0) { throw 'Не удалось выполнить первичную настройку split-tunnel.ps1.' }
+} else {
+    $task = 'VPNGateKeepGateways'
+    $tr = "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$Dest\keep-gateways.ps1`""
+    & schtasks.exe /Create /TN $task /SC ONLOGON /RL HIGHEST /F /TR $tr | Out-Null
+    $running = @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" |
+        Where-Object { $_.CommandLine -like '*keep-gateways.ps1*' })
+    if (-not $running) {
+        Start-Process powershell.exe -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-WindowStyle','Hidden','-File',"`"$Dest\keep-gateways.ps1`"")
+    }
 }
 
 Say ''
 Say 'Готово. VPN сам не подключён.'
 Say "Файлы: $Dest"
+Say 'Задачи VPNGateKeepGateways и TrafikRuler установлены.'
 Say 'Дальше человек один раз открывает SoftEther VPN Client Manager и подключается через VPN Gate.'
-Say 'Программы, которым нужен обычный интернет, добавляются правилом в TrafikRuler. Остальные идут в VPN.'
+Say 'В окне «VPN Gate — Окно» есть блок «Приложения без VPN»: отметьте программы, которым нужен обычный интернет.'
 Say 'Два профиля SoftEther одновременно не включать.'

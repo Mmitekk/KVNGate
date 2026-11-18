@@ -12,8 +12,8 @@ if %errorlevel% neq 0 (
     exit /b
 )
 
-powershell -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT%" %*
+powershell -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT%" -Review %*
 echo.
-echo === Done. Closing in 5 sec ===
-timeout /t 5 >nul
+echo Окно можно закрыть.
+pause
 exit /b

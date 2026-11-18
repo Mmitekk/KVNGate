@@ -23,7 +23,7 @@ param(
     [string]$VpncmdPath = '',
     [string]$Country = '',
     [string]$ExcludeCountry = 'RU',
-    [string]$ExcludeIp = '219.100.37.*,218.100.37.*',
+    [string]$ExcludeIp = '',
     [double]$MinSpeedMbps = 1,
     [int]$MaxSessions = 500,
     [string]$Ports = '443,5555,992',
@@ -38,7 +38,14 @@ param(
     [switch]$Force,
     [switch]$Disconnect,
     [switch]$Status,
-    [switch]$Quiet
+    [switch]$Quiet,
+    [switch]$Review,
+    [switch]$Once,
+    [string]$ReportPath = '',
+    [string]$SkipEndpoint = '',
+    [switch]$Rotate,                   # следующий шлюз идёт дальше по кругу и не
+                                       # возвращается к уже пропущенным
+    [switch]$Inventory
 )
 
 $ErrorActionPreference = 'Continue'
@@ -47,9 +54,9 @@ try { [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityP
 
 # ---------- самоповышение прав ----------
 #
-# Нужно для Protect-AgentRoute: прибить /32-маршруты к API-адресам агента
-# на физический интерфейс, чтобы переключение VPN не рвало связь агента.
-# New-NetRoute требует прав администратора.
+# Нужно для маршрутов и TrafikRuler: вернуть шлюз Wi-Fi/кабеля,
+# который срезает SoftEther, и запустить перехват по программам.
+# New-NetRoute и перехват требуют прав администратора.
 #
 # ВАЖНО: при запуске через `-File script.ps1 -Disconnect` PowerShell
 # разбирает ключи в блок param, и $args остаётся ПУСТЫМ. Старая версия
@@ -67,6 +74,12 @@ if (-not $env:VPNGATE_NO_ELEVATE -and -not $Status) {
         if ($KeepAlive)            { $argList += '-KeepAlive' }
         if ($NoTcpProbe)           { $argList += '-NoTcpProbe' }
         if ($Quiet)                { $argList += '-Quiet' }
+        if ($Review)               { $argList += '-Review' }
+        if ($Once)                 { $argList += '-Once' }
+        if ($Inventory)            { $argList += '-Inventory' }
+        if ($ReportPath)           { $argList += @('-ReportPath', ('"' + $ReportPath + '"')) }
+        if ($SkipEndpoint)         { $argList += @('-SkipEndpoint', $SkipEndpoint) }
+        if ($Rotate)               { $argList += '-Rotate' }
         if ($Country)              { $argList += @('-Country', $Country) }
         if ($ExcludeCountry)       { $argList += @('-ExcludeCountry', $ExcludeCountry) }
         if ($ExcludeIp)            { $argList += @('-ExcludeIp', $ExcludeIp) }
@@ -79,7 +92,8 @@ if (-not $env:VPNGATE_NO_ELEVATE -and -not $Status) {
         if ($MaxSessions -ne 500)      { $argList += @('-MaxSessions', $MaxSessions) }
         if ($VpncmdPath)               { $argList += @('-VpncmdPath', ('"' + $VpncmdPath + '"')) }
         try {
-            Start-Process -FilePath 'powershell.exe' -ArgumentList $argList -Verb RunAs -WindowStyle Hidden | Out-Null
+            $window = $(if ($Review -and -not $Once) { 'Normal' } else { 'Hidden' })
+            Start-Process -FilePath 'powershell.exe' -ArgumentList $argList -Verb RunAs -WindowStyle $window | Out-Null
             exit 0
         } catch {
             Write-Host "Не удалось повысить права: $($_.Exception.Message)"
@@ -94,8 +108,12 @@ $CacheDir    = Join-Path $env:LOCALAPPDATA 'VPNGateAuto'
 $CacheFile   = Join-Path $CacheDir 'last-list.csv'
 $KnownFile   = Join-Path $CacheDir 'known-good.txt'
 $BadFile     = Join-Path $CacheDir 'known-bad.txt'
+$RotationFile = Join-Path $CacheDir 'rotation.txt'
 $LogFile     = Join-Path $CacheDir 'last-run.log'
 $Utf8NoBom   = New-Object System.Text.UTF8Encoding($false)
+$script:RotationRound = 1
+$script:RotationSeen  = 0
+$script:RotationTotal = 0
 
 $script:LogLines = New-Object System.Collections.ArrayList
 function Msg([string]$s) {
@@ -147,6 +165,48 @@ function Invoke-VpnCmd([string[]]$Commands) {
     } catch { "EXCEPTION: $($_.Exception.Message)" }
 }
 
+function Get-AccountEndpoint([string]$Name) {
+    $ip = $null
+    $port = 443
+    $cur = ''
+    foreach ($line in ((Invoke-VpnCmd @('AccountList')) -split "`r?`n")) {
+        $norm = ($line -replace '^\s+|\s+$', '') -replace '\s*\|\s*', '|'
+        if ($norm -match '^VPN Connection Setting Name\|(.+)') { $cur = $Matches[1].Trim() }
+        elseif ($cur -eq $Name -and $norm -match '^VPN Server Hostname\|(.+)') {
+            $hostLine = $Matches[1].Trim()
+            if ($hostLine -match '(\d{1,3}(?:\.\d{1,3}){3})(?::(\d+))?') {
+                $ip = $Matches[1]
+                if ($Matches[2]) { $port = [int]$Matches[2] }
+            }
+        }
+    }
+    return [pscustomobject]@{ Ip = $ip; Port = $port }
+}
+
+function Write-UiReport([string]$Path, [bool]$Ok, $Server, [int]$Port, $Exit, [string]$Message) {
+    if (-not $Path) { return }
+    $obj = [ordered]@{
+        ok          = $Ok
+        host        = if ($Server) { [string]$Server.Host } else { '' }
+        ip          = if ($Server) { [string]$Server.Ip } else { '' }
+        port        = $Port
+        country     = if ($Server) { [string]$Server.CountryL } else { '' }
+        speedMbps   = if ($Server) { [int]$Server.SpeedMbps } else { 0 }
+        sessions    = if ($Server) { [int]$Server.Sessions } else { 0 }
+        exitIp      = if ($Exit) { [string]$Exit.Ip } else { '' }
+        exitCountry = if ($Exit) { [string]$Exit.Country } else { '' }
+        message     = $Message
+        rotationRound = $script:RotationRound
+        rotationSeen  = $script:RotationSeen
+        rotationTotal = $script:RotationTotal
+    }
+    try {
+        $dir = Split-Path -Parent $Path
+        if ($dir -and -not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+        [System.IO.File]::WriteAllText($Path, (($obj | ConvertTo-Json -Compress) + "`r`n"), $Utf8NoBom)
+    } catch {}
+}
+
 # ---------- сеть ----------
 
 function Get-HttpText([string]$Url, [int]$TimeoutSec = 20) {
@@ -171,17 +231,26 @@ function Get-IpFromText([string]$Text) {
 }
 
 function Get-ExitInfo {
-    foreach ($u in @('http://ip-api.com/line/?fields=query,country,isp', 'http://api.ipify.org/')) {
+    foreach ($u in @('http://ip-api.com/json/?fields=status,country,query', 'http://ip-api.com/json/?fields=status,country,query')) {
         $r = Get-HttpText $u 10
         if (-not $r) { continue }
-        $t = $r.Trim()
-        $ip = Get-IpFromText $t
-        if (-not $ip) { continue }
-        $country = ''
-        if ($t -match '\|\s*([A-Za-z]{2})\s*\|') { $country = $Matches[1].Trim() }
-        return [pscustomobject]@{ Ip = $ip; Country = $country; Raw = ($t -replace "`r?`n", ' / ') }
+        try { $j = $r | ConvertFrom-Json } catch { continue }
+        if ($j.status -eq 'success' -and $j.query) {
+            return [pscustomobject]@{ Ip = [string]$j.query; Country = [string]$j.country; Raw = $r.Trim() }
+        }
     }
+    $ip = Get-IpFromText (Get-HttpText 'http://api.ipify.org/' 8)
+    if ($ip) { return [pscustomobject]@{ Ip = $ip; Country = ''; Raw = $ip } }
     return $null
+}
+
+function Get-IpCountry([string]$Ip) {
+    if (-not $Ip) { return '' }
+    $r = Get-HttpText ("http://ip-api.com/json/{0}?fields=status,country" -f $Ip) 8
+    if (-not $r) { return '' }
+    try { $j = $r | ConvertFrom-Json } catch { return '' }
+    if ($j.status -eq 'success' -and $j.country) { return [string]$j.country }
+    return ''
 }
 
 # Параллельный TCP-зонд: батчами по 48 одновременных коннектов.
@@ -248,6 +317,33 @@ function Get-AccountStates {
 
 function Test-SessionUp([string]$Status) { return ($Status -eq 'Connected' -or $Status -eq 'Online') }
 
+function Get-AccountRecords {
+    $list = New-Object System.Collections.ArrayList
+    $out = Invoke-VpnCmd @('AccountList')
+    if (-not $out) { return @() }
+    $cur = $null
+    foreach ($line in ($out -split "`r?`n")) {
+        $norm = ($line -replace '^\s+|\s+$', '') -replace '\s*\|\s*', '|'
+        if ($norm -match '^VPN Connection Setting Name\|(.+)') {
+            if ($cur) { [void]$list.Add($cur) }
+            $cur = [pscustomobject]@{ Name = $Matches[1].Trim(); Status = ''; Host = ''; Ip = ''; Port = 0; Nic = '' }
+        } elseif ($cur -and $norm -match '^Status\|(.+)') {
+            $cur.Status = $Matches[1].Trim()
+        } elseif ($cur -and $norm -match '^VPN Server Hostname\|(.+)') {
+            $raw = $Matches[1].Trim()
+            $cur.Host = ($raw -replace '\s*\(.*\)\s*$', '').Trim()
+            if ($raw -match '(\d{1,3}(?:\.\d{1,3}){3})(?::(\d+))?') {
+                $cur.Ip = $Matches[1]
+                if ($Matches[2]) { $cur.Port = [int]$Matches[2] }
+            }
+        } elseif ($cur -and $norm -match '^Virtual Network Adapter Name\|(.+)') {
+            $cur.Nic = $Matches[1].Trim()
+        }
+    }
+    if ($cur) { [void]$list.Add($cur) }
+    return @($list.ToArray())
+}
+
 # ---------- known good / bad ----------
 
 function Read-Endpoints([string]$Path) {
@@ -286,6 +382,33 @@ function Add-KnownBad([string]$Ep) {
     Write-Endpoints $BadFile $list
 }
 
+# ---------- круг шлюзов ----------
+#
+# «Следующий шлюз» не должен возвращаться к предыдущему. Старая версия
+# вычёркивала только текущий адрес, и список снова начинался с соседнего
+# known-good — окно прыгало France ↔ UAE. Здесь запоминаются IP, которые уже
+# были в текущем круге. Когда они заканчиваются, начинается новый круг.
+
+function Read-Rotation {
+    $set = New-Object 'System.Collections.Generic.HashSet[string]'
+    $script:RotationRound = 1
+    $script:RotationTotal = 0
+    if (Test-Path $RotationFile) {
+        foreach ($l in @(Get-Content $RotationFile -Encoding UTF8 -ErrorAction SilentlyContinue)) {
+            $t = $l.Trim()
+            if ($t -match '^round=(\d+)$') { $script:RotationRound = [int]$Matches[1] }
+            elseif ($t -match '^total=(\d+)$') { $script:RotationTotal = [int]$Matches[1] }
+            elseif ($t -match '^\d{1,3}(\.\d{1,3}){3}$') { [void]$set.Add($t) }
+        }
+    }
+    return ,$set
+}
+
+function Save-Rotation($Set) {
+    $lines = @("round=$script:RotationRound", "total=$script:RotationTotal") + @($Set | Sort-Object)
+    try { [System.IO.File]::WriteAllText($RotationFile, (($lines -join "`r`n") + "`r`n"), $Utf8NoBom) } catch {}
+}
+
 # ---------- исключения по подсети ----------
 
 $script:Excludes = @($ExcludeIp.Split(',; ') | Where-Object { $_ } | ForEach-Object { $_.TrimEnd('.*') })
@@ -318,6 +441,68 @@ $svc = Get-Service | Where-Object { $_.Name -in 'SEVPNCLIENT', 'vpnclient' } | S
 if ($svc -and $svc.Status -ne 'Running') {
     Msg "» Запускаю службу $($svc.Name)…"
     try { Start-Service $svc.Name -ErrorAction Stop } catch { Msg "  не удалось: $($_.Exception.Message)" }
+}
+
+if ($Inventory) {
+    $byIp = @{}
+    if (Test-Path $CacheFile) {
+        foreach ($line in @(Get-Content $CacheFile -Encoding UTF8 -ErrorAction SilentlyContinue)) {
+            if (-not $line -or $line[0] -eq '*' -or $line[0] -eq '#') { continue }
+            $f = $line.Split(',')
+            if ($f.Count -lt 7) { continue }
+            $ip = $f[1].Trim()
+            if ($ip -match '^\d{1,3}(\.\d{1,3}){3}$' -and -not $byIp.ContainsKey($ip)) {
+                $byIp[$ip] = [pscustomobject]@{ Host = $f[0]; Country = $f[5] }
+            }
+        }
+    }
+    $records = @(Get-AccountRecords)
+    $up = @($records | Where-Object { Test-SessionUp $_.Status })
+    $exit = if ($up.Count -gt 0) { Get-ExitInfo } else { $null }
+    $sessions = @()
+    foreach ($rec in $records) {
+        $known = if ($rec.Ip) { $byIp[$rec.Ip] } else { $null }
+        $hostName = if ($known -and $known.Host) { [string]$known.Host } elseif ($rec.Host -and $rec.Host -ne $rec.Ip) { [string]$rec.Host } else { '' }
+        $sessions += [ordered]@{
+            name     = [string]$rec.Name
+            status   = [string]$rec.Status
+            host     = $hostName
+            ip       = [string]$rec.Ip
+            port     = [int]$rec.Port
+            country  = if ($known -and $known.Country) { [string]$known.Country } else { Get-IpCountry $rec.Ip }
+            nic      = [string]$rec.Nic
+            mine     = ($rec.Name -eq $AccountName -or $rec.Name -like 'VPNGATE_AUTO_*')
+            connected = [bool](Test-SessionUp $rec.Status)
+        }
+    }
+    $active = $up | Select-Object -First 1
+    $activeKnown = if ($active -and $active.Ip) { $byIp[$active.Ip] } else { $null }
+    $rot = Read-Rotation
+    $obj = [ordered]@{
+        ok          = ($up.Count -gt 0)
+        inventory   = $true
+        host        = if ($activeKnown) { [string]$activeKnown.Host } elseif ($active) { [string]$active.Host } else { '' }
+        ip          = if ($active) { [string]$active.Ip } else { '' }
+        port        = if ($active) { [int]$active.Port } else { 0 }
+        country     = if ($activeKnown -and $activeKnown.Country) { [string]$activeKnown.Country } elseif ($active) { Get-IpCountry $active.Ip } elseif ($exit) { [string]$exit.Country } else { '' }
+        speedMbps   = 0
+        sessions    = $sessions.Count
+        exitIp      = if ($exit) { [string]$exit.Ip } else { '' }
+        exitCountry = if ($exit) { [string]$exit.Country } else { '' }
+        message     = if ($up.Count -gt 0) { 'подключено' } else { 'Нет активных сессий SoftEther' }
+        rotationRound = $script:RotationRound
+        rotationSeen  = $rot.Count
+        rotationTotal = $script:RotationTotal
+        accounts    = $sessions
+    }
+    if ($ReportPath) {
+        try { [System.IO.File]::WriteAllText($ReportPath, (($obj | ConvertTo-Json -Depth 4 -Compress) + "`r`n"), $Utf8NoBom) } catch {}
+    }
+    foreach ($rec in $records) {
+        Msg ("  {0,-12} {1}  {2}:{3}  {4}" -f $rec.Status, $rec.Name, $rec.Ip, $rec.Port, $(if ($byIp.ContainsKey($rec.Ip)) { $byIp[$rec.Ip].Country } else { '' }))
+    }
+    Save-Log
+    exit 0
 }
 
 # ---------- список серверов ----------
@@ -399,96 +584,10 @@ if ($ExcludeCountry) {
 $pool = @($rows | Where-Object { $_.SpeedMbps -ge $MinSpeedMbps -and $_.Sessions -le $MaxSessions })
 if (-not $pool) { Msg 'Нет серверов под условия. Ослабьте: -MinSpeedMbps 1 -MaxSessions 999'; Save-Log; exit 1 }
 
-# ---------- защита канала агента ----------
+# ---------- транспорт туннеля ----------
 #
-# Подключение VPN переключает default-route на адаптер SoftEther. Агент,
-# который этим скриптом управляется, ходит в API по тому же интернету —
-# и на переключении его соединение рвётся (пользователь наблюдает это как
-# «VPN отключает агента»).
-#
-# Решение — РАЗДЕЛЕНИЕ МАРШРУТОВ:
-#   • /32 к API-адресам агента  → Wi-Fi (или Ethernet 2, если Wi-Fi нет).
-#     /32 всегда точнее 0.0.0.0/0, поэтому трафик агента идёт напрямую и
-#     переживает любые переключения VPN. Пользовательский трафик при этом
-#     по-прежнему идёт через VPN — как и задумано.
-#   • /32 к IP VPN-сервера     → Ethernet 2 (транспорт туннеля по проводу),
-#     чтобы сам туннель не закручивался сам в себя и не уходил на Wi-Fi.
-
-$script:AgentIface = $null
-function Get-AgentInterface {
-    if ($script:AgentIface) { return $script:AgentIface }
-    # приоритет: Wi-Fi (он не задействован в VPN), иначе проводной
-    $wifi = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
-        Where-Object { ($_.InterfaceAlias -match 'Беспроводная|Wireless|Wi-Fi| WLAN') -and $_.IPAddress -notmatch '^169\.254\.' } |
-        Select-Object -First 1
-    if ($wifi) { $script:AgentIface = $wifi; return $wifi }
-    $eth = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
-        Where-Object { $_.InterfaceAlias -notmatch 'VPN|Radmin|TAP|TUN' -and $_.IPAddress -notmatch '^169\.254\.' } |
-        Select-Object -First 1
-    $script:AgentIface = $eth
-    return $eth
-}
-
-function Protect-AgentRoute {
-    try {
-        $eth = Get-AgentInterface
-        if (-not $eth) { return 0 }
-        $gw = (Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |
-            Where-Object { $_.InterfaceIndex -eq $eth.InterfaceIndex } | Select-Object -First 1).NextHop
-        if (-not $gw) { return 0 }
-
-        # адреса, куда ходит локальный агент:
-        #  - текущие TCP-соединения процессов MiniMax Code / node
-        #  - плюс A-records API-хостов (CDN-адреса ротируются, а /32 нужен
-        #    именно на тот IP, по которому реально идёт TLS)
-        $agentPids = @(Get-Process -ErrorAction SilentlyContinue |
-            Where-Object { $_.ProcessName -match 'MiniMax|node' } | Select-Object -ExpandProperty Id)
-        $targets = New-Object System.Collections.ArrayList
-        if ($agentPids.Count) {
-            Get-NetTCPConnection -State Established -ErrorAction SilentlyContinue |
-                Where-Object { $agentPids -contains $_.OwningProcess -and $_.RemotePort -eq 443 } |
-                Select-Object -ExpandProperty RemoteAddress -Unique |
-                ForEach-Object { [void]$targets.Add($_) }
-        }
-        foreach ($hostName in @('api.minimaxi.com','api.minimax.io','api.minimaxi.chat')) {
-            try {
-                Resolve-DnsName $hostName -Type A -ErrorAction SilentlyContinue |
-                    Where-Object { $_.IPAddress } | Select-Object -ExpandProperty IPAddress -Unique |
-                    ForEach-Object { [void]$targets.Add($_) }
-            } catch {}
-        }
-        if (-not $targets.Count) { return 0 }
-
-        $added = 0
-        # 1) точные /32 на каждый известный адрес
-        foreach ($ip in @($targets | Sort-Object -Unique)) {
-            $have = Get-NetRoute -DestinationPrefix "$ip/32" -ErrorAction SilentlyContinue |
-                Where-Object { $_.InterfaceIndex -eq $eth.InterfaceIndex }
-            if (-not $have) {
-                New-NetRoute -DestinationPrefix "$ip/32" -InterfaceIndex $eth.InterfaceIndex -NextHop $gw -RouteMetric 1 -ErrorAction SilentlyContinue | Out-Null
-                $added++
-            }
-        }
-        # 2) плюс /24 вокруг каждого — CDN-адреса ротируются, и без этого
-        #    новый IP из той же сети успевает уехать в туннель (и сменить
-        #    мой внешний IP прямо посреди TLS-сессии → обрыв связи)
-        #
-        #    /16 целиком НЕ вешаем: Akamai/Alibaba — это YouTube, Telegram,
-        #    Discord и почти весь интернет. Перехват /16 уводил
-        #    пользовательский трафик мимо VPN.
-        foreach ($ip in @($targets | Sort-Object -Unique)) {
-            if ($ip -notmatch '^(\d{1,3}\.\d{1,3}\.\d{1,3})\.\d{1,3}$') { continue }
-            $net = "$($Matches[1]).0/24"
-            $have = Get-NetRoute -DestinationPrefix $net -ErrorAction SilentlyContinue |
-                Where-Object { $_.InterfaceIndex -eq $eth.InterfaceIndex }
-            if (-not $have) {
-                New-NetRoute -DestinationPrefix $net -InterfaceIndex $eth.InterfaceIndex -NextHop $gw -RouteMetric 1 -ErrorAction SilentlyContinue | Out-Null
-                $added++
-            }
-        }
-        return $added
-    } catch { return 0 }
-}
+# /32 к IP VPN-сервера → провод, чтобы туннель не уходил сам в себя
+# и не закручивался через Wi-Fi.
 
 # DNS на туннельном адаптере — приравниваем к физическому.
 #
@@ -568,7 +667,7 @@ $script:GuardPath = Join-Path $PSScriptRoot 'route-guard.ps1'
 function Invoke-RouteGuard {
     try {
         if (-not (Test-Path $script:GuardPath)) { return '' }
-        $out = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $script:GuardPath -NoElevate 2>&1
+        $out = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $script:GuardPath -NoElevate -NoAppSplit 2>&1
         $last = ($out | Where-Object { $_ -match '^\[\d\d:\d\d:\d\d\]' } | Select-Object -Last 1)
         if ($last) { return ($last -replace '^\[\d\d:\d\d:\d\d\]\s*', '') }
         return ''
@@ -588,8 +687,39 @@ function Start-RouteGuardDaemon {
             Where-Object { $_.CommandLine -like '*route-guard*' })
         if ($running.Count) { return 0 }
         $args = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"' + $script:GuardPath + '"'),
-                  '-Watch', '-IntervalSec', '2', '-NoElevate')
+                  '-Watch', '-IntervalSec', '2', '-NoElevate', '-NoAppSplit')
         Start-Process -FilePath 'powershell.exe' -ArgumentList $args -WindowStyle Hidden | Out-Null
+        return 1
+    } catch { return 0 }
+}
+
+$script:KeepGatewaysPath = Join-Path $PSScriptRoot 'keep-gateways.ps1'
+function Start-KeepGateways {
+    try {
+        if (-not (Test-Path $script:KeepGatewaysPath)) { return 0 }
+        $pidFile = Join-Path (Join-Path $env:LOCALAPPDATA 'VPNGateAuto') 'keep-gateways.pid'
+        if (Test-Path $pidFile) {
+            $txt = (Get-Content -Raw $pidFile -ErrorAction SilentlyContinue).Trim()
+            if ($txt -match '^\d+$' -and (Get-Process -Id ([int]$txt) -ErrorAction SilentlyContinue)) { return 0 }
+        }
+        & schtasks.exe /Query /TN 'VPNGateKeepGateways' 2>$null | Out-Null
+        if ($LASTEXITCODE -eq 0) {
+            & schtasks.exe /Run /TN 'VPNGateKeepGateways' 2>&1 | Out-Null
+            return 1
+        }
+        Start-Process -FilePath 'powershell.exe' -WindowStyle Hidden -ArgumentList @(
+            '-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden',
+            '-File', ('"' + $script:KeepGatewaysPath + '"')
+        ) | Out-Null
+        return 1
+    } catch { return 0 }
+}
+
+function Start-TrafikRuler {
+    try {
+        $split = Join-Path $PSScriptRoot 'split-tunnel.ps1'
+        if (-not (Test-Path $split)) { return 0 }
+        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $split -EnsureRuler -NoElevate 2>&1 | Out-Null
         return 1
     } catch { return 0 }
 }
@@ -606,7 +736,6 @@ function Stop-RouteGuardDaemon {
         return $procs.Count
     } catch { return 0 }
 }
-Protect-AgentRoute | Out-Null
 
 # ---------- починка маршрутов ----------
 #
@@ -635,22 +764,16 @@ function Repair-Routes {
                 $fixed++
             }
         }
-        # 2) гарантировать рабочий default через физический интерфейс
-        $phys = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
-            Where-Object { $_.InterfaceAlias -notmatch 'VPN|Radmin|TAP|TUN' -and $_.IPAddress -notmatch '^169\.254\.' } |
-            Select-Object -First 1
-        if ($phys) {
-            $have = @(Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |
-                Where-Object { $_.InterfaceIndex -eq $phys.InterfaceIndex })
-            if (-not $have) {
-                $gw = (Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |
-                    Where-Object { $_.InterfaceAlias -eq $phys.InterfaceAlias } | Select-Object -First 1).NextHop
-                if (-not $gw) { $gw = $phys.PrefixOrigin }
-                New-NetRoute -DestinationPrefix '0.0.0.0/0' -InterfaceIndex $phys.InterfaceIndex -NextHop $gw -RouteMetric 0 -ErrorAction SilentlyContinue | Out-Null
-                $fixed++
-            }
-        }
-    } catch {}
+                # 2) возвращаем default на физические адаптеры: keep-gateways
+                #    знает реальный шлюз и ставит метрику 30 — хуже VPN, но
+                #    лучше мёртвого маршрута и нужен TrafikRuler
+                $kg = Join-Path $PSScriptRoot 'keep-gateways.ps1'
+                if (Test-Path $kg) {
+                    $out = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $kg -Once 2>&1
+                    $n = @($out | Where-Object { "$_" -match '^\d+$' } | Select-Object -Last 1)
+                    if ($n) { $fixed += [int]$n }
+                }
+            } catch {}
     return $fixed
 }
 
@@ -677,10 +800,10 @@ if ($Disconnect) {
         Invoke-VpnCmd "NicDisable $n" | Out-Null
     }
     Repair-Routes | Out-Null
-    Protect-AgentRoute | Out-Null
     Invoke-RouteGuard | Out-Null
     Stop-RouteGuardDaemon | Out-Null
     Msg 'Отключено (пользовательские профили не тронуты).'
+    Write-UiReport $ReportPath $false $null 0 $null 'Отключено'
     Save-Log; exit 0
 }
 
@@ -735,10 +858,26 @@ if ($Status) {
         Write-Host ("  {0,-24} шлюз {1,-14} эффективная метрика {2}" -f $r.InterfaceAlias, $r.NextHop, $eff)
     }
 
-    # 5) где реально сидит трафик агента
+    # 5) где реально сидят программы с правилом «без VPN»
     Write-Host ''
+    $trSettings = Join-Path $env:APPDATA 'TrafikRuler\settings.json'
+    $appNames = @()
+    if (Test-Path $trSettings) {
+        try {
+            $tr = Get-Content -Raw -Encoding UTF8 $trSettings | ConvertFrom-Json
+            $appNames = @($tr.Rules | Where-Object { $_.Enabled } |
+                ForEach-Object { [System.IO.Path]::GetFileNameWithoutExtension([string]$_.ProgramPath) } |
+                Where-Object { $_ } | Sort-Object -Unique)
+        } catch {}
+    }
+    if (-not $appNames.Count) {
+        Write-Host 'Программы без VPN: включённых правил TrafikRuler нет.'
+        Write-Host '  Включить: окно VPN Gate → «Приложения без VPN».'
+        exit 0
+    }
+
     $agentPids = @(Get-Process -ErrorAction SilentlyContinue |
-        Where-Object { $_.ProcessName -match 'MiniMax|node' } | Select-Object -ExpandProperty Id)
+        Where-Object { $appNames -contains $_.ProcessName } | Select-Object -ExpandProperty Id)
     $conns = @(Get-NetTCPConnection -State Established -ErrorAction SilentlyContinue |
         Where-Object { $agentPids -contains $_.OwningProcess })
     $tunnel = @{}
@@ -752,7 +891,7 @@ if ($Status) {
         if (-not $byLocal.ContainsKey($k)) { $byLocal[$k] = 0 }
         $byLocal[$k]++
     }
-    Write-Host 'Соединения агента (MiniMax Code):'
+    Write-Host ('Соединения без VPN ({0}):' -f ($appNames -join ', '))
     $leak = 0
     foreach ($k in ($byLocal.Keys | Sort-Object)) {
         $n = $byLocal[$k]
@@ -765,14 +904,17 @@ if ($Status) {
             Write-Host ("  {0,-16} {1,3} соедин.  через {2}" -f $k, $n, $alias) -ForegroundColor Green
         }
     }
-    if ($byLocal.Count -eq 0) { Write-Host '  (соединений сейчас нет)' }
+    if ($byLocal.Count -eq 0) {
+        Write-Host '  (программы не запущены или соединений сейчас нет)'
+        exit 0
+    }
 
     Write-Host ''
     if ($leak -gt 0) {
-        Write-Host '⚠ Часть трафика агента идёт через туннель — сессия может оборваться.' -ForegroundColor Red
-        Write-Host '  Исправить: запустите route-guard.ps1 (он поднимет права через UAC).' -ForegroundColor Yellow
+        Write-Host '⚠ Часть трафика этих программ идёт через туннель.' -ForegroundColor Red
+        Write-Host '  Проверьте правило в окне VPN Gate → «Приложения без VPN» и перезапустите программу.' -ForegroundColor Yellow
     } else {
-        Write-Host '✔ Агент полностью вне туннеля — сессия стабильна.' -ForegroundColor Green
+        Write-Host '✔ Программы без VPN идут мимо туннеля.' -ForegroundColor Green
     }
     exit 0
 }
@@ -824,19 +966,35 @@ $directIpGuess = Get-DirectIp
 if ($foreignUp.Count -gt 0) {
     Msg "» У вас работает чужая сессия SoftEther: $($foreignUp -join ', ')"
     Msg '  Я её не трогаю. Подбор нового сервера её оборвёт — выходите.'
+    Write-UiReport $ReportPath $false $null 0 $null ("Чужая сессия SoftEther: " + ($foreignUp -join ', '))
     Save-Log; exit 2
 }
 
 # Моя сессия уже поднята? Тогда SoftEther-маршрут в default-route — это
 # мой собственный VPN, а не чужая сессия. Раньше здесь скрипт путал одно с
 # другим и выходил с кодом 2, не запуская KeepAlive.
-if ($mineUp.Count -gt 0 -and -not $Force) {
+if ($mineUp.Count -gt 0 -and -not $Force -and -not $SkipEndpoint -and -not $Rotate) {
     $info = Get-ExitInfo
     $mineAlive = $info -and (-not $directIpGuess) -and ($info.Ip -ne $directIpGuess)
     if ($mineAlive) {
         Msg "» Моё подключение уже активно: $($mineUp -join ', ')"
         Msg "  Внешний адрес: $($info.Ip) $($info.Country)"
-        if ($KeepAlive) {
+        if ($Once) {
+            $epNow = Get-AccountEndpoint $AccountName
+            $rowNow = $rows | Where-Object { $_.Ip -eq $epNow.Ip } | Select-Object -First 1
+            if (-not $rowNow) {
+                $shownIp = if ($epNow.Ip) { $epNow.Ip } else { '?' }
+                $rowNow = [pscustomobject]@{ Host = 'текущий'; Ip = $shownIp; CountryL = $info.Country; SpeedMbps = 0; Sessions = 0 }
+            }
+            $portNow = if ($epNow.Port) { [int]$epNow.Port } else { 443 }
+            Write-UiReport $ReportPath $true $rowNow $portNow $info 'подключено'
+            Save-Log
+            exit 0
+        }
+        if ($Review) {
+            Msg '  Сейчас замерю этот шлюз. Его можно оставить или пропустить.'
+            $script:ReuseExisting = $true
+        } elseif ($KeepAlive) {
             Msg '  Перехожу в режим KeepAlive.'
             # переходим вниз к циклу KeepAlive, не переподключаясь заново
             $script:ReuseExisting = $true
@@ -846,12 +1004,13 @@ if ($mineUp.Count -gt 0 -and -not $Force) {
         }
     } else {
         Msg "» Моя сессия поднята, но интернет через неё не идёт — переподключаюсь."
-        Invoke-VpnCmd "AccountDisconnect $acct" | Out-Null
+        Invoke-VpnCmd "AccountDisconnect $AccountName" | Out-Null
     }
 }
-if (-not $script:ReuseExisting -and $softEtherUp -and -not $Force) {
+if (-not $script:ReuseExisting -and $softEtherUp -and -not $Force -and -not $SkipEndpoint -and -not $Rotate) {
     Msg "» Трафик сейчас идёт через SoftEther-адаптер ($($defRoute.InterfaceAlias))."
     Msg '  Подбор нового сервера перехватит маршрут. Для замены укажите -Force.'
+    Write-UiReport $ReportPath $false $null 0 $null 'Уже работает другой туннель SoftEther'
     Save-Log; exit 2
 }
 
@@ -915,24 +1074,149 @@ foreach ($s in $inter) {
     }
 }
 
+# ---------- круг ----------
+#
+# -Rotate: «следующий» идёт дальше, а не возвращается к тому, который только
+# что пропустили. Из списка убираются все IP, уже бывшие в текущем круге.
+
+$rankedFull = @($ranked)
+$rotation = Read-Rotation
+$hadRotationFile = Test-Path $RotationFile
+$rankedIpSet = @{}
+foreach ($item in $ranked) { $rankedIpSet[$item.Ip] = $true }
+$script:RotationSeen  = @($rotation | Where-Object { $rankedIpSet.ContainsKey($_) }).Count
+$script:RotationTotal = $rankedIpSet.Count
+
+if ($Rotate) {
+    $currentIp = ''
+    if ($mineUp.Count -gt 0) {
+        $epCur = Get-AccountEndpoint $AccountName
+        if ($epCur.Ip) { $currentIp = [string]$epCur.Ip }
+    }
+    if (-not $currentIp -and $SkipEndpoint) { $currentIp = ($SkipEndpoint.Split(':')[0]).Trim() }
+
+    if (-not $hadRotationFile) {
+        # Первый запуск нового кода. В known-good лежат шлюзы, которые уже
+        # подключались (свежий сверху) — именно они и давали прыжок
+        # France ↔ UAE. Считаем весь known-good пройденным, а также всё,
+        # что стоит в общем списке до текущего шлюза: следующий пойдёт дальше.
+        for ($i = 0; $i -lt $ranked.Count; $i++) {
+            if ($ranked[$i].Known) { [void]$rotation.Add($ranked[$i].Ip) }
+        }
+        $curIdx = -1
+        for ($i = 0; $i -lt $ranked.Count; $i++) {
+            if ($ranked[$i].Ip -eq $currentIp) { $curIdx = $i; break }
+        }
+        for ($i = 0; $i -le $curIdx; $i++) { [void]$rotation.Add($ranked[$i].Ip) }
+    }
+    if ($currentIp) { [void]$rotation.Add($currentIp) }
+
+    $fresh = @($ranked | Where-Object { -not $rotation.Contains($_.Ip) })
+    if ($fresh.Count -eq 0 -and $ranked.Count -gt 0) {
+        # Круг пройден: все шлюзы из списка уже были. Начинаем следующий.
+        $script:RotationRound++
+        $rotation.Clear()
+        if ($currentIp) { [void]$rotation.Add($currentIp) }
+        $fresh = @($ranked | Where-Object { -not $rotation.Contains($_.Ip) })
+        if ($fresh.Count -eq 0) { $fresh = @($ranked) }
+        Msg "» Круг пройден — начинаю новый (круг $script:RotationRound)"
+    }
+
+    $ranked = New-Object System.Collections.ArrayList
+    foreach ($item in $fresh) { [void]$ranked.Add($item) }
+
+    $left = @($fresh | ForEach-Object { $_.Ip } | Sort-Object -Unique).Count
+    $script:RotationSeen  = @($rotation | Where-Object { $rankedIpSet.ContainsKey($_) }).Count
+    $script:RotationTotal = $script:RotationSeen + $left
+    Save-Rotation $rotation
+    Msg ("» Круг {0}: впереди {1} из {2} шлюзов" -f $script:RotationRound, $left, $script:RotationTotal)
+} elseif ($SkipEndpoint) {
+    $skipIp = ($SkipEndpoint.Split(':')[0]).Trim()
+    if ($skipIp) {
+        $kept = @($ranked | Where-Object { $_.Ip -ne $skipIp })
+        $ranked = New-Object System.Collections.ArrayList
+        foreach ($item in $kept) { [void]$ranked.Add($item) }
+        Msg "» Пропускаю шлюз $skipIp"
+    }
+}
+
+# Проверенные шлюзы, которые круг отложил в сторону. Если новые страны не
+# поднялись (провайдер пропускает единицы адресов), пробуем их, а не уходим
+# в пустоту на 40 минут.
+$fallback = @()
+if ($Rotate) {
+    $freshIpSet = @{}
+    foreach ($it in @($ranked)) { $freshIpSet[$it.Ip] = $true }
+    $fbSeen = @{}
+    foreach ($it in $rankedFull) {
+        if (-not $it.Known) { continue }
+        if ($it.Ip -eq $currentIp) { continue }
+        if ($freshIpSet.ContainsKey($it.Ip)) { continue }
+        if ($fbSeen.ContainsKey($it.Ip)) { continue }
+        $fbSeen[$it.Ip] = $true
+        $fallback += $it
+    }
+    if ($fallback.Count) {
+        Msg ("» Резерв: {0} проверенных шлюзов" -f $fallback.Count)
+    }
+}
+
 Msg ''
 Msg "══ Кандидатов: $($ranked.Count) (из них известно-рабочих: $(@($ranked | Where-Object { $_.Known }).Count)) ══"
 
 # ---------- параллельный TCP-зонд ----------
 
-$candidates = @($ranked)
-if (-not $NoTcpProbe) {
+$script:candidates = @($ranked)
+$script:Probed = $false
+$script:ProbeAlive = 0
+function Update-CandidateProbe {
+    if ($NoTcpProbe -or $script:Probed) { return }
+    $script:Probed = $true
     $t0 = Get-Date
-    $alive = @(Test-TcpMany $candidates $TcpProbeTimeoutMs)
+    $alive = @(Test-TcpMany $script:candidates $TcpProbeTimeoutMs)
     $el = [int]((Get-Date) - $t0).TotalSeconds
-    Msg "» TCP-зонд ($($candidates.Count) адресов, ${el} с): живых $((@($alive)).Count)"
+    $script:ProbeAlive = $alive.Count
+    Msg "» TCP-зонд ($($script:candidates.Count) адресов, ${el} с): живых $($alive.Count)"
     if ($alive.Count) {
-        $candidates = @($alive)
+        $script:candidates = @($alive)
     } else {
-        Msg '  Ни один порт не отвечает — пробую без фильтра.'
+        Msg '  Ни один порт не отвечает — живых новых нет.'
     }
-    # known-good всегда идём первыми, даже если TCP-зонд их не увидел
-    $candidates = @(@($candidates | Where-Object { $_.Known }) + @($candidates | Where-Object { -not $_.Known }))
+    $script:candidates = @(@($script:candidates | Where-Object { $_.Known }) + @($script:candidates | Where-Object { -not $_.Known }))
+}
+if (-not $script:ReuseExisting) { Update-CandidateProbe }
+
+# Живой резерв (Франция/ОАЭ и другие known-good) проверяем отдельно: он
+# должен идти ПОСЛЕ новых стран, но не должен заставлять ждать, пока
+# переберутся сотни мёртвых адресов.
+if ($fallback.Count -gt 0 -and -not $NoTcpProbe) {
+    $fbAlive = @(Test-TcpMany $fallback $TcpProbeTimeoutMs)
+    if ($fbAlive.Count -gt 0) {
+        $fbAliveSet = @{}
+        foreach ($x in $fbAlive) { $fbAliveSet["$($x.Ip):$($x.Port)"] = $true }
+        $fallback = @($fallback | Where-Object { $fbAliveSet.ContainsKey("$($_.Ip):$($_.Port)") })
+    }
+    if ($fallback.Count) { Msg "» Резерв отвечает по TCP: $($fallback.Count)" }
+}
+
+$freshCandidates = @($script:candidates)
+if ($script:ProbeAlive -eq 0 -and $fallback.Count -gt 0) {
+    Msg '  Живых новых нет — перехожу к проверенным шлюзам.'
+    $freshCandidates = @()
+} else {
+    $limit = if ($script:ProbeAlive -gt 0) { 6 } else { 12 }
+    if ($freshCandidates.Count -gt $limit) {
+        Msg ("  Ограничиваю перебор новыми: {0} из {1}" -f $limit, $freshCandidates.Count)
+        $freshCandidates = @($freshCandidates[0..($limit - 1)])
+    }
+}
+$candidates = @($freshCandidates) + @($fallback)
+if ($fallback.Count -gt 0) {
+    Msg ("» Очередь: {0} новых + {1} проверенных" -f $freshCandidates.Count, $fallback.Count)
+}
+if ($candidates.Count -gt 0) {
+    $preview = @($candidates | Select-Object -First 8 | ForEach-Object { "$($_.Ip):$($_.Port)" })
+    Msg ("» Первые адреса: " + ($preview -join ', '))
 }
 
 # ---------- подготовка профиля ----------
@@ -958,6 +1242,7 @@ if ($script:ReuseExisting) {
         if ($norm -match '^Virtual Network Adapter Name\|(.+)') { $nic = $Matches[1].Trim() -replace ' - VPN Client$','' }
     }
     Msg "» Использую уже поднятую сессию $acct (адаптер $nic)"
+    Invoke-VpnCmd "AccountDetailSet $acct /MAXTCP:1 /INTERVAL:1 /TTL:0 /HALF:no /BRIDGE:no /MONITOR:no /NOTRACK:yes /NOQOS:no" | Out-Null
 } else {
 
 # удаляем наши старые профили (чужие не трогаем)
@@ -997,7 +1282,7 @@ Invoke-VpnCmd "AccountAnonymousSet $acct" | Out-Null
 Invoke-VpnCmd "AccountServerCertDisable $acct" | Out-Null
 Invoke-VpnCmd "AccountStatusHide $acct" | Out-Null
 Invoke-VpnCmd "AccountRetrySet $acct /NUM:999 /INTERVAL:1" | Out-Null
-Invoke-VpnCmd "AccountDetailSet $acct /NOQOS:yes /MAXTCP:1 /INTERVAL:1" | Out-Null
+Invoke-VpnCmd "AccountDetailSet $acct /NOQOS:yes /MAXTCP:1 /INTERVAL:1 /TTL:0 /HALF:no /BRIDGE:no /MONITOR:no /NOTRACK:yes" | Out-Null
 
 $vfy = Invoke-VpnCmd @('AccountList')
 $curAcct = ''; $nicOfAcct = ''
@@ -1027,25 +1312,108 @@ function Test-Exit([string]$DirectIp) {
     return $info
 }
 
+function Measure-Gateway {
+    Msg '  меряю пинг и загрузку…'
+    $pingText = 'нет ответа'
+    try {
+        $samples = @(Test-Connection -ComputerName '1.1.1.1' -Count 4 -ErrorAction SilentlyContinue)
+        $times = @($samples | Where-Object { $null -ne $_.ResponseTime } | ForEach-Object { [int]$_.ResponseTime })
+        if ($times.Count -gt 0) {
+            $avg = [int](($times | Measure-Object -Average).Average)
+            $pingText = ('{0} мс, ответов {1}/4' -f $avg, $times.Count)
+        }
+    } catch {}
+
+    $downText = 'не скачалось'
+    if (Get-Command curl.exe -ErrorAction SilentlyContinue) {
+        $raw = & curl.exe -4 -sS -o NUL -w '%{size_download} %{time_total}' --max-time 20 'https://speed.cloudflare.com/__down?bytes=2000000' 2>$null
+        $parts = @(($raw | Out-String).Trim() -split '\s+')
+        if ($parts.Count -ge 2) {
+            $inv = [Globalization.CultureInfo]::InvariantCulture
+            $bytes = 0.0
+            $sec = 0.0
+            $okBytes = [double]::TryParse($parts[0], [Globalization.NumberStyles]::Float, $inv, [ref]$bytes)
+            $okSec = [double]::TryParse($parts[1], [Globalization.NumberStyles]::Float, $inv, [ref]$sec)
+            if ($okBytes -and $okSec -and $bytes -gt 100000 -and $sec -gt 0) {
+                $downText = ('{0} Мбит/с за {1} с' -f ([math]::Round(($bytes * 8) / $sec / 1000000, 1)), ([math]::Round($sec, 1)))
+            }
+        }
+    }
+    return [pscustomobject]@{ Ping = $pingText; Down = $downText }
+}
+
+function Read-GatewayChoice($Server, [int]$Port, $Exit) {
+    $probe = Measure-Gateway
+    Msg ''
+    Msg '════ Шлюз ════'
+    Msg ("Страна:    {0}" -f $Server.CountryL)
+    Msg ("Сервер:    {0}" -f $Server.Host)
+    Msg ("Адрес:     {0}:{1}" -f $Server.Ip, $Port)
+    Msg ("В списке:  {0} Мбит/с, сессий {1}" -f $Server.SpeedMbps, $Server.Sessions)
+    if ($Exit) { Msg ("Снаружи:   {0} {1}" -f $Exit.Ip, $Exit.Country) }
+    Msg ("Пинг:      {0}" -f $probe.Ping)
+    Msg ("Загрузка:  {0}" -f $probe.Down)
+    Msg ''
+    Msg 'Enter — оставить этот шлюз'
+    Msg 'S — пропустить и подключиться к следующему'
+    Msg 'Q — отключить VPN и выйти'
+    $answer = Read-Host 'Выбор'
+    switch -Regex ($answer.Trim()) {
+        '^(s|S|п|П|ы|Ы)$' { return 'skip' }
+        '^(q|Q|й|Й)$' { return 'quit' }
+        default { return 'keep' }
+    }
+}
+
 $timeBudget = (Get-Date).AddMinutes($MaxFallbackMin)
 $attempt = 0
 $ok = $null; $okPort = 0; $ext = $null
 
+$script:SkipEndpoints = @{}
 if ($script:ReuseExisting) {
-    # сессия уже поднята — перебор не нужен, сразу в KeepAlive
-    $ok = [pscustomobject]@{ Host = 'текущий'; Ip = '?'; CountryL = '?'; SpeedMbps = 0 }
-    $ext = Get-ExitInfo
-    $okPort = 443
+    $epNow = Get-AccountEndpoint $acct
+    $rowNow = $rows | Where-Object { $_.Ip -eq $epNow.Ip } | Select-Object -First 1
+    if (-not $rowNow) {
+        $shownIp = if ($epNow.Ip) { $epNow.Ip } else { '?' }
+        $rowNow = [pscustomobject]@{ Host = 'текущий'; Ip = $shownIp; Score = 0; SpeedMbps = 0; CountryL = '?'; CountryS = '??'; Sessions = 0 }
+    }
+    $extNow = Get-ExitInfo
+    $portNow = if ($epNow.Port) { [int]$epNow.Port } else { 443 }
+    if ($Review) {
+        $choice = Read-GatewayChoice $rowNow $portNow $extNow
+        if ($choice -eq 'keep') {
+            $ok = $rowNow; $okPort = $portNow; $ext = $extNow
+        } elseif ($choice -eq 'quit') {
+            Invoke-VpnCmd "AccountDisconnect $acct" | Out-Null
+            Msg 'Отключено.'
+            Save-Log
+            exit 0
+        } else {
+            if ($epNow.Ip) { $script:SkipEndpoints["$($epNow.Ip):$portNow"] = $true }
+            Invoke-VpnCmd "AccountDisconnect $acct" | Out-Null
+            $script:ReuseExisting = $false
+            Msg '  пропускаю текущий шлюз, ищу следующий'
+            Update-CandidateProbe
+            $candidates = @($script:candidates)
+        }
+    } else {
+        $ok = $rowNow; $okPort = $portNow; $ext = $extNow
+    }
 }
 
 foreach ($ep in $candidates) {
     if ($ok) { break }
+    if ($script:SkipEndpoints.ContainsKey("$($ep.Ip):$($ep.Port)")) { continue }
     if ((Get-Date) -gt $timeBudget) { Msg "  бюджет ${MaxFallbackMin} мин исчерпан"; break }
 
     $s = $ep.Srv
     $label = if ($ep.Known) { "$($s.Host) [проверен]" } else { "$($s.Host) ($($s.CountryL))" }
     $attempt++
     Msg ("[{0}/{1}] {2} {3}:{4}" -f $attempt, $candidates.Count, $label, $ep.Ip, $ep.Port)
+    if ($Rotate) {
+        if ($rotation.Add($ep.Ip)) { $script:RotationSeen++ }
+        Save-Rotation $rotation
+    }
 
     # мягко гасим предыдущую попытку, затем переключаем сервер
     Invoke-VpnCmd "AccountDisconnect $acct" | Out-Null
@@ -1109,6 +1477,13 @@ foreach ($ep in $candidates) {
     # проходом — секунды, и именно в него успевал произойти «плохой»
     # резолв. Поэтому чиним ДО проверки выхода, а не после.
     Protect-TunnelDns | Out-Null
+    # Wi-Fi должен иметь свой default, иначе TrafikRuler не выпустит
+    # программу мимо туннеля: SoftEther постоянно срезает этот шлюз.
+    $gw = Start-KeepGateways
+    if ($gw) { Msg '  шлюзы Wi-Fi/кабеля: демон keep-gateways запущен' }
+    if (Test-Path $script:KeepGatewaysPath) {
+        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $script:KeepGatewaysPath -Once 2>&1 | Out-Null
+    }
 
     $info = Test-Exit $directIp
     if (-not $info) {
@@ -1118,22 +1493,31 @@ foreach ($ep in $candidates) {
         continue
     }
 
-    Add-KnownGood "$($ep.Ip):$($ep.Port)"
-    $ok = $s; $okPort = $ep.Port; $ext = $info
-    # после подключения маршруты агента надо прибить заново — VPN только что
-    # перехватил default-route
-    $fixed = Protect-AgentRoute
-    if ($fixed) { Msg "  защита канала агента: прибито $fixed маршрут(ов)" }
-    # полный проход route-guard: снимает дубли с Ethernet 2, чинит
-    # мёртвые маршруты, приравнивает DNS туннеля к физическому
+    # после подключения маршруты надо починить: VPN только что перехватил
+    # default-route. Per-app разделение делает TrafikRuler, поэтому guard
+    # запускаем без маршрутов по IP — только DNS и битые default.
     $guard = Invoke-RouteGuard
     if ($guard) { Msg "  route-guard: $guard" }
-    # запускаем watchdog маршрутов: пока VPN поднят, он каждые 2 секунды
-    # ловит новые CDN-адреса агента и прибивает их на Wi-Fi. Без него
-    # новый адрес (ротация Akamai/Alibaba) успевал уехать в туннель —
-    # и сессия агента рвалась.
     Start-RouteGuardDaemon | Out-Null
+    Start-TrafikRuler | Out-Null
     Msg "  ✔ интернет через VPN: $($info.Ip) $($info.Country)"
+    if ($Review) {
+        $choice = Read-GatewayChoice $s $ep.Port $info
+        if ($choice -eq 'skip') {
+            Invoke-VpnCmd "AccountDisconnect $acct" | Out-Null
+            $script:SkipEndpoints["$($ep.Ip):$($ep.Port)"] = $true
+            Msg '  пропускаю этот шлюз'
+            continue
+        }
+        if ($choice -eq 'quit') {
+            Invoke-VpnCmd "AccountDisconnect $acct" | Out-Null
+            Msg 'Отключено.'
+            Save-Log
+            exit 0
+        }
+    }
+    Add-KnownGood "$($ep.Ip):$($ep.Port)"
+    $ok = $s; $okPort = $ep.Port; $ext = $info
     break
 }
 
@@ -1144,10 +1528,15 @@ if ($ok) {
     Msg "Подключено к VPN Gate"
     Msg "Сервер:      $($ok.Host) ($($ok.CountryL))"
     Msg "Адрес:       $($ok.Ip):$okPort"
-    Msg "Внешний IP:  $($ext.Ip) $($ext.Country)"
+    $extText = if ($ext) { "$($ext.Ip) $($ext.Country)" } else { 'не определился' }
+    Msg "Внешний IP:  $extText"
     Msg "Профиль:     $acct (адаптер $nic)"
     Msg "Сменить сервер: -Force. Отключить: -Disconnect."
     Save-Log
+    if ($Once) {
+        Write-UiReport $ReportPath $true $ok $okPort $ext 'подключено'
+        exit 0
+    }
 
     # ---------- режим -KeepAlive ----------
     #
@@ -1174,12 +1563,9 @@ if ($ok) {
                 $rf = Repair-Routes
                 if ($rf) { Msg "[keepalive] починено маршрутов: $rf" }
 
-                # 2) прибиваем канал агента к физическому интерфейсу
-                $fixed = Protect-AgentRoute
-                if ($fixed) { Msg "[keepalive] защита канала: прибито $fixed маршрут(ов)" }
-
-                # 2a) полный проход route-guard: дубли с провода, DNS туннеля,
-                #     мёртвые маршруты. Без этого агент уезжает в туннель.
+                # 2) route-guard: DNS туннеля и мёртвые default.
+                #    Per-app разделение делает TrafikRuler, маршруты по IP
+                #    больше не нужны.
                 $g = Invoke-RouteGuard
                 if ($g) { Msg "[keepalive] route-guard: $g" }
 
@@ -1235,6 +1621,7 @@ if ($ok) {
     Msg ''
     Msg "Не удалось подключиться. Проверено: $attempt"
     Msg 'Попробуйте позже (фильтрация меняется), -Country JP,KR,US или -ConnectTimeoutSec 60.'
+    Write-UiReport $ReportPath $false $null 0 $null "Не удалось подключиться. Проверено: $attempt"
     Save-Log
     exit 1
 }
