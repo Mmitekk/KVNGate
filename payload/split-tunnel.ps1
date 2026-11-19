@@ -57,6 +57,12 @@ $script:PolicyFile = Join-Path $script:StateDir 'agent-policies.txt'
 $script:GatewayPid = Join-Path $script:StateDir 'keep-gateways.pid'
 $script:GatewayScript = Join-Path $PSScriptRoot 'keep-gateways.ps1'
 
+# Сеть читается через netutil.ps1 (сначала WMI, при заклинившем WMI — netsh).
+# Без этого панель «Приложения без VPN» и правила не работали, когда WMI
+# зависал (18.11.2026).
+$NetUtilPath = Join-Path $PSScriptRoot 'netutil.ps1'
+if (Test-Path $NetUtilPath) { . $NetUtilPath }
+
 function Test-Admin {
     $id = [Security.Principal.WindowsIdentity]::GetCurrent()
     $pr = New-Object Security.Principal.WindowsPrincipal($id)
@@ -135,6 +141,9 @@ function Find-Rule($Settings, [string]$Pattern) {
 }
 
 function Get-AdapterList {
+    if (Get-Command Get-NuAdapters -ErrorAction SilentlyContinue) {
+        return @(Get-NuAdapters)
+    }
     return @(Get-NetAdapter -ErrorAction SilentlyContinue)
 }
 
@@ -142,11 +151,11 @@ function Get-DefaultAdapter {
     $all = Get-AdapterList
     $wifi = @($all | Where-Object {
         ($_.Name -match 'Беспроводная|Wireless|Wi-Fi|WLAN' -or $_.InterfaceDescription -match 'Wireless|802\.11') -and
-        $_.Status -eq 'Up'
+        $_.IsUp
     } | Select-Object -First 1)
     if ($wifi) { return $wifi[0] }
     $eth = @($all | Where-Object {
-        $_.Name -match '^Ethernet' -and $_.Status -eq 'Up' -and $_.InterfaceDescription -notmatch 'TAP|TUN|Virtual'
+        $_.Name -match '^Ethernet' -and $_.IsUp -and $_.InterfaceDescription -notmatch 'TAP|TUN|Virtual'
     } | Select-Object -First 1)
     if ($eth) { return $eth[0] }
     return $null
@@ -159,7 +168,7 @@ function Resolve-Adapter([string]$Name) {
     if (-not $exact) {
         $exact = @($all | Where-Object { $_.Name -like "*$Name*" -or $_.InterfaceDescription -like "*$Name*" })
     }
-    $up = @($exact | Where-Object { $_.Status -eq 'Up' } | Select-Object -First 1)
+    $up = @($exact | Where-Object { $_.IsUp } | Select-Object -First 1)
     if ($up) { return $up[0] }
     if ($exact.Count) { return $exact[0] }
     return $null
@@ -167,6 +176,11 @@ function Resolve-Adapter([string]$Name) {
 
 function Get-AdapterIPv4($Adapter) {
     if (-not $Adapter) { return '' }
+    if (Get-Command Get-NuAdapterIp -ErrorAction SilentlyContinue) {
+        $ip = Get-NuAdapterIp $Adapter.ifIndex
+        if ($ip) { return [string]$ip }
+        return ''
+    }
     $ip = @(Get-NetIPAddress -InterfaceIndex $Adapter.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue |
         Where-Object { $_.IPAddress -and $_.IPAddress -notmatch '^169\.254\.' } | Select-Object -First 1)
     if ($ip) { return [string]$ip[0].IPAddress }
@@ -184,7 +198,8 @@ function Get-RulerExe {
     foreach ($c in $candidates) {
         if ($c -and (Test-Path -LiteralPath $c)) { return $c }
     }
-    $task = Get-ScheduledTask -TaskName 'TrafikRuler' -ErrorAction SilentlyContinue
+    $task = $null
+    try { $task = Get-ScheduledTask -TaskName 'TrafikRuler' -ErrorAction Stop } catch { $task = $null }
     if ($task -and $task.Actions.Count) {
         $exe = [string]$task.Actions[0].Execute
         $exe = $exe.Trim('"').Trim("'")
@@ -194,6 +209,12 @@ function Get-RulerExe {
         if (-not $m.Success) { $m = [regex]::Match($argText, '(?i)([A-Z]:\\[^\"]*TrafikRuler\.exe)') }
         if ($m.Success -and (Test-Path -LiteralPath $m.Groups[1].Value)) { return $m.Groups[1].Value }
     }
+    # WMI недоступен — читаем задачу через schtasks.
+    try {
+        $q = & schtasks.exe /Query /TN 'TrafikRuler' /FO LIST /V 2>$null | Out-String
+        $m2 = [regex]::Match($q, '(?i)([A-Z]:\\[^\r\n"]*TrafikRuler\.exe)')
+        if ($m2.Success -and (Test-Path -LiteralPath $m2.Groups[1].Value)) { return $m2.Groups[1].Value }
+    } catch {}
     return $null
 }
 
@@ -332,13 +353,10 @@ function Test-GatewaysDaemon {
     if (Test-Path $script:GatewayPid) {
         $txt = (Get-Content -Raw -ErrorAction SilentlyContinue $script:GatewayPid).Trim()
         if ($txt -match '^\d+$') {
-            $proc = Get-CimInstance Win32_Process -Filter "ProcessId=$([int]$txt)" -ErrorAction SilentlyContinue
-            if ($proc -and (-not $proc.CommandLine -or $proc.CommandLine -like '*keep-gateways.ps1*')) { return $true }
+            if (Get-Process -Id ([int]$txt) -ErrorAction SilentlyContinue) { return $true }
         }
     }
-    $p = @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
-        Where-Object { $_.CommandLine -like '*keep-gateways.ps1*' } | Select-Object -First 1)
-    return [bool]$p
+    return $false
 }
 
 function Start-GatewaysDaemon {
@@ -369,11 +387,6 @@ function Stop-GatewaysDaemon {
             if ($p) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue; $n++ }
         }
     }
-    $procs = @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
-        Where-Object { $_.CommandLine -like '*keep-gateways.ps1*' })
-    foreach ($p in $procs) {
-        try { Stop-Process -Id $p.ProcessId -Force -ErrorAction Stop; $n++ } catch {}
-    }
     Remove-Item $script:GatewayPid -Force -ErrorAction SilentlyContinue
     return $n
 }
@@ -393,16 +406,32 @@ function Install-RulerTask {
     $exe = Get-RulerExe
     if (-not $exe) { throw 'TrafikRuler.exe не найден.' }
     $name = 'TrafikRuler'
-    Stop-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
-    Unregister-ScheduledTask -TaskName $name -Confirm:$false -ErrorAction SilentlyContinue
     $who = [Security.Principal.WindowsIdentity]::GetCurrent().Name
     $arg = '/c taskkill /IM TrafikRuler.exe /F >nul 2>&1 & start "" "' + $exe + '" --minimized'
-    $action = New-ScheduledTaskAction -Execute 'cmd.exe' -Argument $arg
-    $trigger = New-ScheduledTaskTrigger -AtLogOn -User $who
-    $principal = New-ScheduledTaskPrincipal -UserId $who -LogonType Interactive -RunLevel Highest
-    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
-    Register-ScheduledTask -TaskName $name -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
-    Start-ScheduledTask -TaskName $name
+
+    # Задачи Windows живут в WMI. Если WMI заклинил, Register-ScheduledTask
+    # не сработает — тогда создаём задачу через schtasks (он WMI не нужен).
+    $wmiOk = $false
+    try {
+        Stop-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
+        Unregister-ScheduledTask -TaskName $name -Confirm:$false -ErrorAction SilentlyContinue
+        $action = New-ScheduledTaskAction -Execute 'cmd.exe' -Argument $arg
+        $trigger = New-ScheduledTaskTrigger -AtLogOn -User $who
+        $principal = New-ScheduledTaskPrincipal -UserId $who -LogonType Interactive -RunLevel Highest
+        $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+        Register-ScheduledTask -TaskName $name -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
+        $wmiOk = $true
+    } catch {
+        Write-Host "WMI недоступен ($($_.Exception.Message)) — задача создаётся через schtasks."
+    }
+    if (-not $wmiOk) {
+        & schtasks.exe /End /TN $name 2>$null | Out-Null
+        & schtasks.exe /Delete /TN $name /F 2>$null | Out-Null
+        $tr = 'cmd.exe /c ' + $arg
+        & schtasks.exe /Create /TN $name /SC ONLOGON /RL HIGHEST /RU $who /F /TR $tr | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw 'Не удалось создать задачу TrafikRuler.' }
+    }
+    & schtasks.exe /Run /TN $name 2>&1 | Out-Null
     Start-Sleep -Milliseconds 1400
 }
 
@@ -418,10 +447,13 @@ function Get-ManagedRouteCount {
 
 function Stop-LegacyGuard {
     $n = 0
-    $procs = @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
-        Where-Object { $_.CommandLine -like '*route-guard.ps1*' })
-    foreach ($p in $procs) {
-        try { Stop-Process -Id $p.ProcessId -Force -ErrorAction Stop; $n++ } catch {}
+    $pidFile = Join-Path $script:StateDir 'route-guard.pid'
+    if (Test-Path $pidFile) {
+        $txt = (Get-Content -Raw -ErrorAction SilentlyContinue $pidFile).Trim()
+        if ($txt -match '^\d+$') {
+            $p = Get-Process -Id ([int]$txt) -ErrorAction SilentlyContinue
+            if ($p) { try { Stop-Process -Id $p.Id -Force -ErrorAction Stop; $n++ } catch {} }
+        }
     }
     Remove-Item (Join-Path $script:StateDir 'route-guard.pid') -Force -ErrorAction SilentlyContinue
     return $n
@@ -439,8 +471,13 @@ function Get-TransportIps {
     $set = @{}
     $pids = @(Get-Process -Name 'vpnclient_x64', 'vpnclient' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id)
     if ($pids.Count) {
-        Get-NetTCPConnection -ErrorAction SilentlyContinue |
-            Where-Object { $pids -contains [int]$_.OwningProcess } |
+        $conns = if (Get-Command Get-NuTcpConnections -ErrorAction SilentlyContinue) {
+            @(Get-NuTcpConnections)
+        } else {
+            @(Get-NetTCPConnection -ErrorAction SilentlyContinue)
+        }
+        $conns |
+            Where-Object { $pids -contains [int]$_.Pid } |
             Select-Object -ExpandProperty RemoteAddress -Unique |
             Where-Object { $_ -match '^\d{1,3}(\.\d{1,3}){3}$' -and $_ -notmatch '^(127\.|0\.0\.0\.0)' } |
             ForEach-Object { $set[$_] = $true }
@@ -467,12 +504,11 @@ function Cleanup-LegacySplit {
     foreach ($prefix in $prefixes) {
         if (Test-PrivateOrServicePrefix $prefix) { continue }
         if ($prefix -match '^(\d{1,3}(?:\.\d{1,3}){3})/32$' -and $transport.ContainsKey($Matches[1])) { continue }
-        foreach ($r in @(Get-NetRoute -DestinationPrefix $prefix -ErrorAction SilentlyContinue)) {
+        foreach ($r in @(Get-NuRoutes | Where-Object { $_.DestinationPrefix -eq $prefix })) {
             if ($r.InterfaceAlias -match 'VPN|Radmin') { continue }
             if ($r.NextHop -eq '0.0.0.0') { continue }
             try {
-                Remove-NetRoute -DestinationPrefix $r.DestinationPrefix -InterfaceIndex $r.InterfaceIndex `
-                    -NextHop $r.NextHop -Confirm:$false -ErrorAction Stop | Out-Null
+                Remove-NuRoute -DestinationPrefix $r.DestinationPrefix -Index $r.ifIndex -NextHop $r.NextHop | Out-Null
                 $removed++
             } catch {}
         }
@@ -498,11 +534,15 @@ function Cleanup-LegacySplit {
 # ---------- статус ----------
 
 function Get-RulesRuntime($Rules) {
-    $allConns = @(Get-NetTCPConnection -State Established -ErrorAction SilentlyContinue)
+    $allConns = if (Get-Command Get-NuTcpConnections -ErrorAction SilentlyContinue) {
+        @(Get-NuTcpConnections)
+    } else {
+        @(Get-NetTCPConnection -State Established -ErrorAction SilentlyContinue)
+    }
     $procs = @(Get-Process -ErrorAction SilentlyContinue)
     $adapters = Get-AdapterList
     $tunnel = @($adapters | Where-Object {
-        ($_.InterfaceDescription -match 'VPN Client Adapter' -or $_.Name -match ' - VPN Client$') -and $_.Status -eq 'Up'
+        ($_.InterfaceDescription -match 'VPN Client Adapter' -or $_.Name -match ' - VPN Client$') -and $_.IsUp
     } | Select-Object -First 1)
     $tunnelIp = if ($tunnel.Count) { Get-AdapterIPv4 $tunnel[0] } else { '' }
 
@@ -550,7 +590,7 @@ function Get-RulesRuntime($Rules) {
             Enabled = [bool]$rule.Enabled
             AdapterName = [string]$rule.AdapterName
             AdapterId = [string]$rule.AdapterId
-            AdapterOk = [bool]($adapter -and $adapter.Status -eq 'Up' -and $adapterIp)
+            AdapterOk = [bool]($adapter -and $adapter.IsUp -and $adapterIp)
             ProcessCount = $ruleProcs.Count
             ConnectionCount = $conns.Count
             DirectConnections = $direct
@@ -565,33 +605,32 @@ function Get-StatusObject {
     $settings = Read-Settings
     $rules = @($settings.Rules)
     $adapters = Get-AdapterList
-    $defaults = @(Get-NetRoute -DestinationPrefix '0.0.0.0/0' -PolicyStore ActiveStore -ErrorAction SilentlyContinue |
-        Where-Object { $_.NextHop -and $_.NextHop -ne '0.0.0.0' })
+    $defaults = @(Get-NuDefaultRoutes | Where-Object { $_.NextHop -and $_.NextHop -ne '0.0.0.0' })
 
     $wifi = @($adapters | Where-Object {
         ($_.Name -match 'Беспроводная|Wireless|Wi-Fi|WLAN' -or $_.InterfaceDescription -match 'Wireless|802\.11')
-    } | Sort-Object @{ Expression = { if ($_.Status -eq 'Up') { 0 } else { 1 } } } | Select-Object -First 1)
+    } | Sort-Object @{ Expression = { if ($_.IsUp) { 0 } else { 1 } } } | Select-Object -First 1)
     if ($wifi) { $wifi = $wifi[0] }
     $wire = @($adapters | Where-Object {
         $_.Name -match '^Ethernet' -and $_.InterfaceDescription -notmatch 'TAP|TUN|Virtual'
-    } | Sort-Object @{ Expression = { if ($_.Status -eq 'Up') { 0 } else { 1 } } } | Select-Object -First 1)
+    } | Sort-Object @{ Expression = { if ($_.IsUp) { 0 } else { 1 } } } | Select-Object -First 1)
     if ($wire) { $wire = $wire[0] }
     $vpn = @($adapters | Where-Object {
-        ($_.InterfaceDescription -match 'VPN Client Adapter' -or $_.Name -match ' - VPN Client$') -and $_.Status -eq 'Up'
+        ($_.InterfaceDescription -match 'VPN Client Adapter' -or $_.Name -match ' - VPN Client$') -and $_.IsUp
     } | Select-Object -First 1)
     if ($vpn) { $vpn = $vpn[0] }
 
     function New-AdapterInfo($ad) {
         if (-not $ad) { return [pscustomobject]@{ Name = ''; Ip = ''; Up = $false; Gateway = ''; HasDefault = $false; Metric = 0 } }
-        $r = @($defaults | Where-Object { $_.InterfaceIndex -eq $ad.ifIndex } | Sort-Object RouteMetric | Select-Object -First 1)
+        $r = @($defaults | Where-Object { $_.ifIndex -eq $ad.ifIndex } | Sort-Object Metric | Select-Object -First 1)
         $gw = if ($r.Count) { [string]$r[0].NextHop } else { '' }
         return [pscustomobject]@{
             Name = [string]$ad.Name
             Ip = (Get-AdapterIPv4 $ad)
-            Up = ($ad.Status -eq 'Up')
+            Up = [bool]$ad.IsUp
             Gateway = $gw
             HasDefault = [bool]$r.Count
-            Metric = if ($r.Count) { [int]$r[0].RouteMetric } else { 0 }
+            Metric = if ($r.Count) { [int]$r[0].Metric } else { 0 }
         }
     }
 
@@ -599,8 +638,14 @@ function Get-StatusObject {
     $logState = Get-RulerLogState
     $runtime = Get-RulesRuntime $rules
     $enabledCount = @($runtime | Where-Object { $_.Enabled }).Count
-    $guard = @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
-        Where-Object { $_.CommandLine -like '*route-guard.ps1*' })
+    $guardPid = Join-Path $script:StateDir 'route-guard.pid'
+    $guard = @()
+    if (Test-Path $guardPid) {
+        $gtxt = (Get-Content -Raw -ErrorAction SilentlyContinue $guardPid).Trim()
+        if ($gtxt -match '^\d+$' -and (Get-Process -Id ([int]$gtxt) -ErrorAction SilentlyContinue)) {
+            $guard = @([pscustomobject]@{ ProcessId = [int]$gtxt })
+        }
+    }
 
     return [pscustomobject]@{
         Time = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')

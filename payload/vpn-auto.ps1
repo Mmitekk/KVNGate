@@ -113,6 +113,12 @@ $GoogleBadFile  = Join-Path $CacheDir 'google-bad.txt'
 $RotationFile = Join-Path $CacheDir 'rotation.txt'
 $LogFile     = Join-Path $CacheDir 'last-run.log'
 $Utf8NoBom   = New-Object System.Text.UTF8Encoding($false)
+
+# Сеть читается через netutil.ps1: сначала WMI-командлеты, но если WMI
+# заклинил (провайдер не отвечает) — netsh/route.exe. Иначе скрипт зависал
+# намертво и считал живые шлюзы мёртвыми (18.11.2026).
+$NetUtilPath = Join-Path $PSScriptRoot 'netutil.ps1'
+if (Test-Path $NetUtilPath) { . $NetUtilPath }
 $script:RotationRound = 1
 $script:RotationSeen  = 0
 $script:RotationTotal = 0
@@ -631,17 +637,19 @@ if (-not $pool) { Msg 'Нет серверов под условия. Ослаб
 # исходящий IP агента остаётся российским.
 function Protect-TunnelDns {
     try {
-        $phys = @(Get-DnsClientServerAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
-            Where-Object { $_.InterfaceAlias -match 'Беспроводная|Wireless|Wi-Fi|^Ethernet' -and
-                           $_.ServerAddresses -and $_.ServerAddresses.Count -gt 0 })
+        $phys = @(Get-NuPhysicalAdapters)
         if (-not $phys) { return 0 }
-        $want = @($phys[0].ServerAddresses)
+        $pick = @($phys | Where-Object { $_.Name -match 'Беспроводная|Wireless|Wi-Fi' } | Select-Object -First 1)
+        if (-not $pick) { $pick = @($phys | Select-Object -First 1) }
+        if (-not $pick) { return 0 }
+        $want = @(Get-NuDnsServers $pick[0].ifIndex)
+        if (-not $want -or -not $want.Count) { return 0 }
         $fixed = 0
-        $tunnels = @(Get-NetAdapter -ErrorAction SilentlyContinue |
-            Where-Object { $_.InterfaceDescription -match 'VPN Client Adapter' -or $_.Name -match ' - VPN Client$' })
+        $tunnels = @(Get-NuAdapters | Where-Object {
+            $_.Description -match 'VPN Client Adapter' -or $_.Name -match ' - VPN Client$'
+        })
         foreach ($t in $tunnels) {
-            $cur = @(Get-DnsClientServerAddress -InterfaceIndex $t.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue |
-                ForEach-Object { $_.ServerAddresses } | Where-Object { $_ })
+            $cur = @(Get-NuDnsServers $t.ifIndex)
             $same = ($cur.Count -eq $want.Count)
             if ($same) {
                 for ($i = 0; $i -lt $want.Count; $i++) {
@@ -649,8 +657,7 @@ function Protect-TunnelDns {
                 }
             }
             if ($same) { continue }
-            Set-DnsClientServerAddress -InterfaceIndex $t.ifIndex -ServerAddresses $want -ErrorAction SilentlyContinue
-            $fixed++
+            if (Set-NuDnsServers -Index $t.ifIndex -Servers $want) { $fixed++ }
         }
         return $fixed
     } catch { return 0 }
@@ -661,21 +668,29 @@ function Protect-TunnelDns {
 function Pin-VpnTransport([string]$ServerIp) {
     try {
         if (-not $ServerIp) { return 0 }
+        if (-not (Get-Command Get-NuDefaultRoutes -ErrorAction SilentlyContinue)) { return 0 }
         # запоминаем текущий сервер: route-guard.ps1 не должен снести /32
         # к нему (иначе туннель уйдёт сам в себя)
         try { [System.IO.File]::WriteAllText((Join-Path $CacheDir 'current-server.txt'), $ServerIp, $Utf8NoBom) } catch {}
-        $wire = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
-            Where-Object { $_.InterfaceAlias -match '^Ethernet' -and $_.IPAddress -notmatch '^169\.254\.' } |
-            Select-Object -First 1
+        $phys = @(Get-NuPhysicalAdapters)
+        if (-not $phys) { return 0 }
+        $wire = @($phys | Where-Object { $_.Name -match '^Ethernet' } | Select-Object -First 1)
+        if (-not $wire) { $wire = @($phys | Select-Object -First 1) }
         if (-not $wire) { return 0 }
-        $gw = (Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |
-            Where-Object { $_.InterfaceIndex -eq $wire.InterfaceIndex } | Select-Object -First 1).NextHop
+        $w = $wire[0]
+        $gw = $null
+        $d = @(Get-NuDefaultRoutes | Where-Object {
+            $_.ifIndex -eq $w.ifIndex -and $_.NextHop -and $_.NextHop -ne '0.0.0.0'
+        } | Sort-Object Metric | Select-Object -First 1)
+        if ($d) { $gw = [string]$d[0].NextHop }
+        elseif ($w.Gateway -and $w.Gateway.Count) { $gw = [string]$w.Gateway[0] }
         if (-not $gw) { return 0 }
-        $have = Get-NetRoute -DestinationPrefix "$ServerIp/32" -ErrorAction SilentlyContinue |
-            Where-Object { $_.InterfaceIndex -eq $wire.InterfaceIndex }
-        if ($have) { return 0 }
-        New-NetRoute -DestinationPrefix "$ServerIp/32" -InterfaceIndex $wire.InterfaceIndex -NextHop $gw -RouteMetric 1 -ErrorAction SilentlyContinue | Out-Null
-        return 1
+        $have = @(Get-NuRoutes | Where-Object {
+            $_.DestinationPrefix -eq "$ServerIp/32" -and $_.ifIndex -eq $w.ifIndex
+        })
+        if ($have.Count) { return 0 }
+        if (Add-NuRoute -Prefix "$ServerIp/32" -Index $w.ifIndex -NextHop $gw -Metric 1) { return 1 }
+        return 0
     } catch { return 0 }
 }
 
@@ -710,10 +725,13 @@ function Invoke-RouteGuard {
 function Start-RouteGuardDaemon {
     try {
         if (-not (Test-Path $script:GuardPath)) { return 0 }
-        # не плодим копии: если watchdog уже есть — второй не нужен
-        $running = @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
-            Where-Object { $_.CommandLine -like '*route-guard*' })
-        if ($running.Count) { return 0 }
+        # не плодим копии: если watchdog уже есть — второй не нужен.
+        # Проверка по PID-файлу, а не через WMI: WMI может быть недоступен.
+        $guardPidFile = Join-Path (Join-Path $env:LOCALAPPDATA 'VPNGateAuto') 'route-guard.pid'
+        if (Test-Path $guardPidFile) {
+            $gtxt = (Get-Content -Raw $guardPidFile -ErrorAction SilentlyContinue).Trim()
+            if ($gtxt -match '^\d+$' -and (Get-Process -Id ([int]$gtxt) -ErrorAction SilentlyContinue)) { return 0 }
+        }
         $args = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"' + $script:GuardPath + '"'),
                   '-Watch', '-IntervalSec', '2', '-NoElevate', '-NoAppSplit')
         Start-Process -FilePath 'powershell.exe' -ArgumentList $args -WindowStyle Hidden | Out-Null
@@ -756,12 +774,16 @@ function Start-TrafikRuler {
 # процесс мог остаться висеть на пару секунд).
 function Stop-RouteGuardDaemon {
     try {
-        $procs = @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
-            Where-Object { $_.CommandLine -like '*route-guard*' })
-        foreach ($p in $procs) {
-            try { Stop-Process -Id $p.ProcessId -Force -ErrorAction Stop } catch {}
+        $n = 0
+        $guardPidFile = Join-Path (Join-Path $env:LOCALAPPDATA 'VPNGateAuto') 'route-guard.pid'
+        if (Test-Path $guardPidFile) {
+            $gtxt = (Get-Content -Raw $guardPidFile -ErrorAction SilentlyContinue).Trim()
+            if ($gtxt -match '^\d+$') {
+                $p = Get-Process -Id ([int]$gtxt) -ErrorAction SilentlyContinue
+                if ($p) { try { Stop-Process -Id $p.Id -Force -ErrorAction Stop; $n++ } catch {} }
+            }
         }
-        return $procs.Count
+        return $n
     } catch { return 0 }
 }
 
@@ -781,14 +803,14 @@ function Repair-Routes {
     $fixed = 0
     try {
         # 1) убрать мёртвые маршруты через отключённые SoftEther-адаптеры
-        $softIfaces = @(Get-NetAdapter -ErrorAction SilentlyContinue |
-            Where-Object { $_.InterfaceDescription -match 'VPN Client Adapter' -or $_.Name -match ' - VPN Client$' })
+        $softIfaces = @(Get-NuAdapters | Where-Object {
+            $_.Description -match 'VPN Client Adapter' -or $_.Name -match ' - VPN Client$'
+        })
         foreach ($ad in $softIfaces) {
-            if ($ad.Status -eq 'Up') { continue }
-            $routes = @(Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |
-                Where-Object { $_.InterfaceIndex -eq $ad.ifIndex })
+            if ($ad.IsUp) { continue }
+            $routes = @(Get-NuDefaultRoutes | Where-Object { $_.ifIndex -eq $ad.ifIndex })
             foreach ($r in $routes) {
-                Remove-NetRoute -DestinationPrefix '0.0.0.0/0' -InterfaceIndex $r.InterfaceIndex -NextHop $r.NextHop -Confirm:$false -ErrorAction SilentlyContinue
+                Remove-NuRoute -Prefix '0.0.0.0/0' -Index $r.ifIndex -NextHop $r.NextHop | Out-Null
                 $fixed++
             }
         }
@@ -869,20 +891,17 @@ if ($Status) {
     # 3) интерфейсы
     Write-Host ''
     Write-Host 'Интерфейсы:'
-    foreach ($a in @(Get-NetAdapter -ErrorAction SilentlyContinue)) {
-        if ($a.Status -ne 'Up') { continue }
-        $ip = (Get-NetIPAddress -AddressFamily IPv4 -InterfaceIndex $a.ifIndex -ErrorAction SilentlyContinue |
-            Where-Object { $_.IPAddress -notmatch '^169\.254\.' } | Select-Object -First 1).IPAddress
-        $metric = (Get-NetIPInterface -AddressFamily IPv4 -InterfaceIndex $a.ifIndex -ErrorAction SilentlyContinue).InterfaceMetric
-        Write-Host ("  [{0,3}] {1,-24} {2,-16} метрика {3}" -f $a.ifIndex, $a.Name, $ip, $metric)
+    foreach ($a in @(Get-NuAdapters)) {
+        if (-not $a.IsUp) { continue }
+        $ip = @(Get-NuAdapterIp $a.ifIndex)
+        Write-Host ("  [{0,3}] {1,-24} {2,-16} метрика {3}" -f $a.ifIndex, $a.Name, ($ip -join ','), $a.Metric)
     }
 
     # 4) default-route — кто сейчас забирает весь трафик
     Write-Host ''
     Write-Host 'Маршрут по умолчанию:'
-    foreach ($r in @(Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue)) {
-        $m = (Get-NetIPInterface -AddressFamily IPv4 -InterfaceIndex $r.InterfaceIndex -ErrorAction SilentlyContinue).InterfaceMetric
-        $eff = $r.RouteMetric + $m
+    foreach ($r in @(Get-NuDefaultRoutes)) {
+        $eff = $r.Metric + $r.InterfaceMetric
         Write-Host ("  {0,-24} шлюз {1,-14} эффективная метрика {2}" -f $r.InterfaceAlias, $r.NextHop, $eff)
     }
 
@@ -906,12 +925,12 @@ if ($Status) {
 
     $agentPids = @(Get-Process -ErrorAction SilentlyContinue |
         Where-Object { $appNames -contains $_.ProcessName } | Select-Object -ExpandProperty Id)
-    $conns = @(Get-NetTCPConnection -State Established -ErrorAction SilentlyContinue |
-        Where-Object { $agentPids -contains $_.OwningProcess })
+    $conns = @(Get-NuTcpConnections | Where-Object { $agentPids -contains $_.Pid })
     $tunnel = @{}
-    Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
-        Where-Object { $_.InterfaceAlias -match ' - VPN Client$|VPN Client Adapter|TAP|TUN' } |
-        ForEach-Object { $tunnel[$_.IPAddress] = $_.InterfaceAlias }
+    foreach ($a in @(Get-NuAdapters)) {
+        if ($a.Name -notmatch ' - VPN Client$|VPN Client Adapter|TAP|TUN' -and $a.Description -notmatch 'VPN Client Adapter|TAP|TUN') { continue }
+        foreach ($ip in $a.IPv4) { $tunnel[$ip] = $a.Name }
+    }
 
     $byLocal = @{}
     foreach ($c in $conns) {
@@ -927,8 +946,10 @@ if ($Status) {
             $leak += $n
             Write-Host ("  {0,-16} {1,3} соедин.  ⚠ ЧЕРЕЗ ТУННЕЛЬ ({2})" -f $k, $n, $tunnel[$k]) -ForegroundColor Red
         } else {
-            $alias = (Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
-                Where-Object { $_.IPAddress -eq $k } | Select-Object -First 1).InterfaceAlias
+            $alias = ''
+            foreach ($a in @(Get-NuAdapters)) {
+                if ($a.IPv4 -contains $k) { $alias = $a.Name; break }
+            }
             Write-Host ("  {0,-16} {1,3} соедин.  через {2}" -f $k, $n, $alias) -ForegroundColor Green
         }
     }
@@ -958,11 +979,11 @@ $foreignUp = @($states.Keys | Where-Object { $_ -notin $mine -and (Test-SessionU
 # которой нет в AccountList — например, подключение через плагин VPN Gate)
 $defRoute = $null
 try {
-    $defRoute = Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction Stop |
-        Sort-Object RouteMetric, InterfaceMetric | Select-Object -First 1
+    $defRoute = Get-NuDefaultRoutes |
+        Sort-Object { $_.Metric + $_.InterfaceMetric } | Select-Object -First 1
 } catch {}
 $softEtherUp = $false
-if ($defRoute -and $defRoute.InterfaceAlias -match ' - VPN Client$') { $softEtherUp = $true }
+if ($defRoute -and ($defRoute.InterfaceAlias -match ' - VPN Client$' -or $defRoute.NextHop -match '^10\.2\d\d\.')) { $softEtherUp = $true }
 
 # ---------- прямой IP (без VPN) ----------
 #
@@ -976,10 +997,10 @@ function Get-DirectIp {
     if (Test-Path $DirectIpFile) { $cached = (Get-Content $DirectIpFile -Raw -Encoding UTF8).Trim() }
     $def = $null
     try {
-        $def = Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction Stop |
-            Sort-Object RouteMetric, InterfaceMetric | Select-Object -First 1
+        $def = Get-NuDefaultRoutes |
+            Sort-Object { $_.Metric + $_.InterfaceMetric } | Select-Object -First 1
     } catch {}
-    $viaVpn = $def -and ($def.InterfaceAlias -match ' - VPN Client$')
+    $viaVpn = $def -and (($def.InterfaceAlias -match ' - VPN Client$') -or ($def.NextHop -match '^10\.2\d\d\.'))
     if (-not $viaVpn) {
         $cur = Get-ExitInfo
         if ($cur -and $cur.Ip) {
@@ -1485,10 +1506,18 @@ foreach ($ep in $candidates) {
     $ipDeadline = (Get-Date).AddSeconds(20)
     while ((Get-Date) -lt $ipDeadline) {
         try {
-            $ipObj = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
-                Where-Object { $_.InterfaceAlias -like "$nic *" -and $_.IPAddress -notmatch '^169\.254\.' -and $_.IPAddress -ne '0.0.0.0' } |
-                Select-Object -First 1
-            if ($ipObj) { $hasRealIp = $true; $vpnIp = $ipObj.IPAddress; break }
+            # Адрес VPN-адаптера берём без WMI: раньше Get-NetIPAddress
+            # отваливался, и живые серверы ошибочно помечались как
+            # «пустая сессия (адаптер без адреса)».
+            $vpnAd = Get-NuVpnAdapter
+            $ipObj = $null
+            if ($vpnAd) {
+                $ipObj = Get-NuAdapterIp $vpnAd.ifIndex
+                if ($ipObj -and ($vpnAd.Name -notlike "$nic *" -and $vpnAd.Name -notlike "$nic")) {
+                    $ipObj = $null
+                }
+            }
+            if ($ipObj) { $hasRealIp = $true; $vpnIp = $ipObj; break }
         } catch {}
         Start-Sleep -Milliseconds 800
     }

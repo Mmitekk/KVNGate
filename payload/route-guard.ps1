@@ -46,6 +46,15 @@ param(
 $ErrorActionPreference = 'Continue'
 $Utf8 = New-Object System.Text.UTF8Encoding($false)
 
+# Сеть берём без WMI: netutil.ps1 читает её через netsh/route.exe,
+# netcompat.ps1 даёт те же cmdlet-имена (Get-NetRoute и т.п.), но без
+# зависимости от WMI. 18.11.2026 WMI заклинил, и весь этот watchdog
+# вместе с демоном шлюзов встал.
+$NetUtilPath = Join-Path $PSScriptRoot 'netutil.ps1'
+if (Test-Path $NetUtilPath) { . $NetUtilPath }
+$NetCompatPath = Join-Path $PSScriptRoot 'netcompat.ps1'
+if (Test-Path $NetCompatPath) { . $NetCompatPath }
+
 # ---------- защита от дублей ----------
 #
 # У повышенных процессов CommandLine в WMI пустой, поэтому определить

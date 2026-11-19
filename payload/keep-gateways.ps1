@@ -7,6 +7,12 @@
 # Метрика 30 хуже маршрута VPN (у него эффективная метрика около 2),
 # поэтому программы без правила TrafikRuler остаются в туннеле.
 #
+# ВАЖНО: состояние сети берётся через netutil.ps1, а не через Net*-командлеты.
+# Те идут через WMI, а WMI на Windows умеет заклинить (18.11.2026 так и было:
+# провайдер перестал отвечать, демон завис, и маршрут в туннель перестал
+# появляться — VPN был «подключён», но трафик шёл мимо). netutil работает
+# через netsh/route.exe и не зависит от WMI.
+#
 # Запуск:
 #   powershell -ExecutionPolicy Bypass -File keep-gateways.ps1        # демон
 #   powershell -ExecutionPolicy Bypass -File keep-gateways.ps1 -Once  # один проход
@@ -24,6 +30,9 @@ $VpnStateFile = Join-Path $StateDir 'vpn-gateway.txt'
 $PidFile   = Join-Path $StateDir 'keep-gateways.pid'
 $LogFile   = Join-Path $StateDir 'keep-gateways.log'
 $RestartFlag = Join-Path $StateDir 'keep-gateways.restart'
+
+$NetUtil = Join-Path $PSScriptRoot 'netutil.ps1'
+if (Test-Path $NetUtil) { . $NetUtil }
 
 function Test-Admin {
     $id = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -58,8 +67,8 @@ function Get-DaemonPid {
     if (-not (Test-Path $PidFile)) { return 0 }
     $txt = (Get-Content $PidFile -Raw -ErrorAction SilentlyContinue).Trim()
     if ($txt -notmatch '^\d+$') { return 0 }
-    $proc = Get-CimInstance Win32_Process -Filter "ProcessId=$([int]$txt)" -ErrorAction SilentlyContinue
-    if ($proc -and $proc.CommandLine -like '*keep-gateways.ps1*') { return [int]$txt }
+    $proc = Get-Process -Id ([int]$txt) -ErrorAction SilentlyContinue
+    if ($proc) { return [int]$txt }
     return 0
 }
 
@@ -94,64 +103,58 @@ function Write-Saved($Map) {
     try { [System.IO.File]::WriteAllLines($StateFile, $lines) } catch {}
 }
 
-function Get-PhysicalAdapters {
-    $adapters = @(Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object {
-        $_.Status -eq 'Up' -and
-        $_.Name -notmatch 'VPN|Radmin|TAP|TUN|vEthernet|WSL|Hyper-V|Loopback' -and
-        $_.InterfaceDescription -notmatch 'VPN Client Adapter|TAP|TUN|Hyper-V|Virtual Adapter'
-    })
-    $result = @()
-    foreach ($ad in $adapters) {
-        $ip = @(Get-NetIPAddress -InterfaceIndex $ad.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue |
-            Where-Object { $_.IPAddress -and $_.IPAddress -notmatch '^169\.254\.' } | Select-Object -First 1)
-        if ($ip) { $result += $ad }
-    }
-    return @($result)
-}
-
 function Get-GatewayFor($Adapter, [string]$Saved) {
     $idx = [int]$Adapter.ifIndex
-    $live = @(Get-NetRoute -DestinationPrefix '0.0.0.0/0' -InterfaceIndex $idx -PolicyStore ActiveStore -ErrorAction SilentlyContinue |
-        Where-Object { $_.NextHop -and $_.NextHop -ne '0.0.0.0' -and $_.NextHop -notmatch '^10\.211\.' } |
-        Sort-Object RouteMetric | Select-Object -First 1)
+
+    # 1. Живой default-маршрут на этом адаптере.
+    $live = @(Get-NuDefaultRoutes | Where-Object {
+        $_.ifIndex -eq $idx -and $_.NextHop -and $_.NextHop -ne '0.0.0.0' -and $_.NextHop -notmatch '^10\.2\d\d\.'
+    } | Sort-Object Metric | Select-Object -First 1)
     if ($live) { return [string]$live[0].NextHop }
 
-    $cfg = Get-NetIPConfiguration -InterfaceIndex $idx -ErrorAction SilentlyContinue
-    $gw = @($cfg.IPv4DefaultGateway | Where-Object { $_.NextHop } | Select-Object -First 1)
-    if ($gw) { return [string]$gw[0].NextHop }
-
-    # DHCP-шлюз остаётся в реестре даже после того, как SoftEther удалил
-    # маршрут из активной таблицы.
-    $regPath = "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces\$($Adapter.InterfaceGuid)"
-    foreach ($name in @('DhcpDefaultGateway', 'DefaultGateway')) {
-        $val = (Get-ItemProperty -Path $regPath -Name $name -ErrorAction SilentlyContinue).$name
-        if ($val) {
-            $first = @($val) | Where-Object { $_ -match '^\d{1,3}(\.\d{1,3}){3}$' -and $_ -ne '0.0.0.0' } | Select-Object -First 1
-            if ($first) { return [string]$first }
+    # 2. Шлюз из настройки адаптера (DHCP или статический).
+    if ($Adapter.Gateway -and $Adapter.Gateway.Count) {
+        foreach ($g in $Adapter.Gateway) {
+            if ($g -and $g -ne '0.0.0.0') { return [string]$g }
         }
     }
 
+    # 3. DHCP-шлюз остаётся в реестре даже после того, как SoftEther удалил
+    #    маршрут из активной таблицы.
+    $regPath = "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces\$($Adapter.InterfaceGuid)"
+    if ($Adapter.InterfaceGuid) {
+        foreach ($name in @('DhcpDefaultGateway', 'DefaultGateway')) {
+            $val = (Get-ItemProperty -Path $regPath -Name $name -ErrorAction SilentlyContinue).$name
+            if ($val) {
+                $first = @($val) | Where-Object { $_ -match '^\d{1,3}(\.\d{1,3}){3}$' -and $_ -ne '0.0.0.0' } | Select-Object -First 1
+                if ($first) { return [string]$first }
+            }
+        }
+    }
+
+    # 4. Сохранённый ранее шлюз.
     if ($Saved -and $Saved -match '^\d{1,3}(\.\d{1,3}){3}$') { return $Saved }
 
-    $alt = @(Get-NetRoute -InterfaceIndex $idx -AddressFamily IPv4 -ErrorAction SilentlyContinue |
-        Where-Object { $_.NextHop -match '^(192\.168|10)\.\d{1,3}\.\d{1,3}$' -and $_.NextHop -notmatch '^10\.211\.' } |
-        Select-Object -First 1)
+    # 5. Любой next hop этого адаптера из таблицы маршрутов.
+    $alt = @(Get-NuRoutes | Where-Object {
+        $_.ifIndex -eq $idx -and $_.NextHop -match '^(192\.168|10)\.\d{1,3}\.\d{1,3}$' -and $_.NextHop -notmatch '^10\.2\d\d\.'
+    } | Select-Object -First 1)
     if ($alt) { return [string]$alt[0].NextHop }
+
     return $null
 }
 
 function Get-VpnAdapter {
-    return @(Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object {
-        $_.Status -eq 'Up' -and
-        ($_.InterfaceDescription -match 'VPN Client Adapter' -or $_.Name -match ' - VPN Client$')
-    } | Select-Object -First 1)
+    $ad = Get-NuVpnAdapter
+    if ($ad) { return $ad }
+    return $null
 }
 
 function Get-VpnGateway($Adapter) {
     if (-not $Adapter) { return $null }
-    $live = @(Get-NetRoute -DestinationPrefix '0.0.0.0/0' -InterfaceIndex $Adapter.ifIndex -PolicyStore ActiveStore -ErrorAction SilentlyContinue |
-        Where-Object { $_.NextHop -and $_.NextHop -ne '0.0.0.0' } |
-        Sort-Object RouteMetric | Select-Object -First 1)
+    $live = @(Get-NuDefaultRoutes | Where-Object {
+        $_.ifIndex -eq $Adapter.ifIndex -and $_.NextHop -and $_.NextHop -ne '0.0.0.0'
+    } | Sort-Object Metric | Select-Object -First 1)
     if ($live) {
         try { [System.IO.File]::WriteAllText($VpnStateFile, [string]$live[0].NextHop) } catch {}
         return [string]$live[0].NextHop
@@ -162,17 +165,17 @@ function Get-VpnGateway($Adapter) {
         if ($saved -match '^\d{1,3}(\.\d{1,3}){3}$') { return $saved }
     }
 
-    $cfg = Get-NetIPConfiguration -InterfaceIndex $Adapter.ifIndex -ErrorAction SilentlyContinue
-    $gw = @($cfg.IPv4DefaultGateway | Where-Object { $_.NextHop } | Select-Object -First 1)
-    if ($gw) {
-        try { [System.IO.File]::WriteAllText($VpnStateFile, [string]$gw[0].NextHop) } catch {}
-        return [string]$gw[0].NextHop
+    if ($Adapter.Gateway -and $Adapter.Gateway.Count) {
+        $g = @($Adapter.Gateway | Where-Object { $_ -and $_ -ne '0.0.0.0' } | Select-Object -First 1)
+        if ($g) {
+            try { [System.IO.File]::WriteAllText($VpnStateFile, [string]$g[0]) } catch {}
+            return [string]$g[0]
+        }
     }
 
     # VPN Gate всегда выдаёт один и тот же шлюз виртуального хаба.
-    $ip = @(Get-NetIPAddress -InterfaceIndex $Adapter.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue |
-        Where-Object { $_.IPAddress -and $_.IPAddress -notmatch '^169\.254\.' } | Select-Object -First 1)
-    if ($ip -and ([string]$ip[0].IPAddress) -match '^10\.211\.') { return '10.211.254.254' }
+    $ip = @(Get-NuAdapterIp $Adapter.ifIndex)
+    if ($ip -and $ip -match '^10\.2\d\d\.') { return '10.211.254.254' }
     return $null
 }
 
@@ -180,19 +183,19 @@ function Invoke-Pass {
     $saved = Read-Saved
     $next = @{}
     $changed = 0
-    foreach ($ad in Get-PhysicalAdapters) {
-        $guid = [string]$ad.InterfaceGuid
-        $gw = Get-GatewayFor $ad $saved[$guid]
+    $defaults = @(Get-NuDefaultRoutes)
+    $adapters = @(Get-NuPhysicalAdapters)
+    foreach ($ad in $adapters) {
+        $gw = Get-GatewayFor $ad $saved[$ad.Name]
         if (-not $gw -or $gw -eq '0.0.0.0') { continue }
-        $next[$guid] = $gw
+        $next[$ad.Name] = $gw
 
-        $has = @(Get-NetRoute -DestinationPrefix '0.0.0.0/0' -InterfaceIndex $ad.ifIndex -PolicyStore ActiveStore -ErrorAction SilentlyContinue |
-            Where-Object { $_.NextHop -eq $gw })
+        $has = @($defaults | Where-Object { $_.ifIndex -eq $ad.ifIndex -and $_.NextHop -eq $gw })
         if ($has.Count -eq 0) {
-            New-NetRoute -DestinationPrefix '0.0.0.0/0' -InterfaceIndex $ad.ifIndex -NextHop $gw `
-                -RouteMetric 30 -PolicyStore ActiveStore -ErrorAction SilentlyContinue | Out-Null
-            Write-GwLog "default $($ad.Name): $gw (метрика 30)"
-            $changed++
+            if (Add-NuRoute -Prefix '0.0.0.0/0' -Index $ad.ifIndex -NextHop $gw -Metric 30) {
+                Write-GwLog "default $($ad.Name): $gw (метрика 30)"
+                $changed++
+            }
         }
     }
     if ($next.Count) { Write-Saved $next }
@@ -201,18 +204,16 @@ function Invoke-Pass {
     # default в туннель после переподключения возвращаем сами.
     $vpn = Get-VpnAdapter
     if ($vpn) {
-        $vip = @(Get-NetIPAddress -InterfaceIndex $vpn.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue |
-            Where-Object { $_.IPAddress -and $_.IPAddress -notmatch '^169\.254\.' } | Select-Object -First 1)
+        $vip = Get-NuAdapterIp $vpn.ifIndex
         if ($vip) {
             $vgw = Get-VpnGateway $vpn
             if ($vgw) {
-                $hasVpn = @(Get-NetRoute -DestinationPrefix '0.0.0.0/0' -InterfaceIndex $vpn.ifIndex -PolicyStore ActiveStore -ErrorAction SilentlyContinue |
-                    Where-Object { $_.NextHop -eq $vgw })
+                $hasVpn = @($defaults | Where-Object { $_.ifIndex -eq $vpn.ifIndex -and $_.NextHop -eq $vgw })
                 if ($hasVpn.Count -eq 0) {
-                    New-NetRoute -DestinationPrefix '0.0.0.0/0' -InterfaceIndex $vpn.ifIndex -NextHop $vgw `
-                        -RouteMetric 1 -PolicyStore ActiveStore -ErrorAction SilentlyContinue | Out-Null
-                    Write-GwLog "default VPN ($($vpn.Name)): $vgw (метрика 1)"
-                    $changed++
+                    if (Add-NuRoute -Prefix '0.0.0.0/0' -Index $vpn.ifIndex -NextHop $vgw -Metric 1) {
+                        Write-GwLog "default VPN ($($vpn.Name)): $vgw (метрика 1)"
+                        $changed++
+                    }
                 }
             }
         }
@@ -227,10 +228,19 @@ if ($Once) {
 }
 
 Write-GwLog "keep-gateways запущен (pid $PID)"
+$fails = 0
 try {
     while ($true) {
-        Invoke-Pass | Out-Null
-        Start-Sleep -Milliseconds 300
+        try {
+            $null = Invoke-Pass
+            $fails = 0
+        } catch {
+            $fails++
+            if ($fails -le 5 -or ($fails % 20) -eq 0) {
+                Write-GwLog "ошибка прохода: $($_.Exception.Message)"
+            }
+        }
+        Start-Sleep -Milliseconds 1000
     }
 } finally {
     try { Remove-Item $PidFile -Force -ErrorAction SilentlyContinue } catch {}
